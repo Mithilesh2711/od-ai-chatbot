@@ -32,6 +32,24 @@ def mongo_to_json(data: Any) -> Any:
     else:
         return data
 
+# Phone number helper function
+def normalize_phone_number(phone: str) -> str:
+    """
+    Normalize phone number by removing country code (91) if present.
+    Used throughout the system for consistency.
+    """
+    if not phone:
+        return phone
+
+    # Remove any non-digit characters
+    phone = ''.join(filter(str.isdigit, phone))
+
+    # Remove 91 prefix if present and number is longer than 10 digits
+    if phone.startswith('91') and len(phone) > 10:
+        return phone[2:]
+
+    return phone
+
 # Load environment variables
 load_dotenv(override=True)
 
@@ -83,28 +101,31 @@ def validate_user(from_number: str) -> Dict[str, Any]:
     Returns user data with userType and entity.
     READ ONLY - No modifications to database.
     """
+    # Normalize phone number for database lookup (remove 91 if present)
+    normalized_phone = normalize_phone_number(from_number)
+
     # Check students table first
-    student = students_collection.find_one({"phone": from_number})
+    student = students_collection.find_one({"phone": normalized_phone})
     if student:
         # Convert to JSON-serializable format
         student_json = mongo_to_json(student)
         return {
             "userType": "student",  # Found in students table
             "entity": student_json.get("entity", "student"),  # Get entity from student data or default to "student"
-            "phone": from_number,
+            "phone": normalized_phone,  # Use only normalized phone throughout
             "session": student_json.get("session"),
             "data": student_json
         }
 
     # Check users table if not found in students
-    user = users_collection.find_one({"phone": from_number})
+    user = users_collection.find_one({"phone": normalized_phone})
     if user:
         # Convert to JSON-serializable format
         user_json = mongo_to_json(user)
         return {
             "userType": "user",  # Found in users table
             "entity": user_json.get("entity", "user"),  # Get entity from user data or default to "user"
-            "phone": from_number,
+            "phone": normalized_phone,  # Use only normalized phone throughout
             "session": None,
             "data": user_json
         }
@@ -115,7 +136,7 @@ def validate_user(from_number: str) -> Dict[str, Any]:
 def validate_communication_config(to_number: str) -> Dict[str, Any]:
     """
     Validates communication configuration for the given toNumber.
-    Returns the matching chatBotConfig or None.
+    Returns the matching chatBotConfig or raises error if not found.
     READ ONLY - No modifications to database.
     """
     # Find config document with matching senderPhone in chatBotConfig
@@ -124,18 +145,30 @@ def validate_communication_config(to_number: str) -> Dict[str, Any]:
     })
 
     if not config_doc:
-        return None
+        raise HTTPException(
+            status_code=404,
+            detail=f"No communication config document found for toNumber {to_number}"
+        )
 
     # Convert to JSON-serializable format
     config_doc_json = mongo_to_json(config_doc)
 
     # Find specific chatBotConfig matching toNumber
     chat_bot_configs = config_doc_json.get("chatBotConfig", [])
+    chat_bot_config = None
+
     for config in chat_bot_configs:
         if config.get("senderPhone") == to_number:
-            return config
+            chat_bot_config = config
+            break
 
-    return None
+    if not chat_bot_config:
+        raise HTTPException(
+            status_code=404,
+            detail=f"chatBotConfig not found for senderPhone {to_number} in communication config document"
+        )
+
+    return chat_bot_config
 
 # Session management - In-memory storage (no DB writes)
 # Using in-memory storage since we cannot write to the database
@@ -168,13 +201,8 @@ async def chat_endpoint(request: ChatRequest):
                 detail=f"User with phone number {request.fromNumber} not found in students or users table"
             )
 
-        # Step 2: Validate communication configuration
+        # Step 2: Validate communication configuration (will raise HTTPException if not found)
         chat_config = validate_communication_config(request.toNumber)
-        if not chat_config:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Communication config not found for toNumber {request.toNumber}"
-            )
 
         # Generate session ID based on fromNumber and toNumber
         session_id = f"{request.fromNumber}_{request.toNumber}_{datetime.utcnow().strftime('%Y%m%d')}"
@@ -190,13 +218,14 @@ async def chat_endpoint(request: ChatRequest):
         history_messages.append(HumanMessage(content=request.query))
 
         # Prepare initial state with all required data
+        # Use normalized phone numbers throughout
         initial_state = State(
             messages=history_messages,
             session_id=session_id,
             user_data=user_data,
             chat_config=chat_config,
-            from_number=request.fromNumber,
-            to_number=request.toNumber
+            from_number=normalize_phone_number(request.fromNumber),  # Use normalized phone
+            to_number=request.toNumber  # toNumber is already in correct format
         )
 
         # Invoke the graph
@@ -204,6 +233,7 @@ async def chat_endpoint(request: ChatRequest):
 
         # Extract response - could be AIMessage or last message if tools were called
         last_message = result['messages'][-1]
+        print(last_message)
         if isinstance(last_message, ToolMessage):
             # If last message is tool result, get the AI message before it
             for msg in reversed(result['messages']):

@@ -7,18 +7,28 @@ import os
 TOOL_BASE_URL = os.getenv("TOOL_BASE_URL", "http://localhost:7070")
 
 # Helper function to make tool API calls
-async def make_tool_call(action_id: str, user_data: Dict, from_number: str, to_number: str) -> Dict[str, Any]:
+async def make_tool_call(action_id: str, user_data: Dict, from_number: str, to_number: str, chat_config: Dict = None) -> Dict[str, Any]:
     """Makes API call to tool endpoint with standard payload"""
     endpoint = f"{TOOL_BASE_URL}/api/{action_id}/chatBotTool"
+
+    # Ensure userType is always passed correctly
+    user_type = user_data.get("userType")
+    if not user_type:
+        # Fallback: determine from entity if userType is missing
+        if "session" in user_data:
+            user_type = "student"
+        else:
+            user_type = "user"
 
     payload = {
         "actionId": action_id,
         "entity": user_data.get("entity", "unknown"),  # Will come from student.entity or user.entity
-        "phone": from_number,
-        "userType": user_data.get("userType", "unknown"),  # "student" if found in students table, "user" if in users table
-        "fromNumber": from_number,
+        "phone": from_number,  # Use normalized phone number
+        "userType": user_type,  # Ensure this is always passed
+        "fromNumber": from_number,  # Normalized phone number
         "toNumber": to_number,
-        "session": user_data.get("session", None)  # Only available for students
+        "session": user_data.get("session", None),  # Only available for students
+        "chatBotConfig": chat_config  # Pass the entire chatBotConfig
     }
 
     try:

@@ -181,7 +181,8 @@ Please specify which report or information you need."""
                     action_id=tool_name,
                     user_data=state.user_data,
                     from_number=state.from_number,
-                    to_number=state.to_number
+                    to_number=state.to_number,
+                    chat_config=state.chat_config
                 )
 
                 tool_calls.append({
