@@ -1,60 +1,16 @@
-from typing import List, Dict, Any, Optional
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
-from pymongo import MongoClient
-from bson import ObjectId
-from dotenv import load_dotenv
-import os
 from datetime import datetime
-import json
 
-# Import graph and state from graph module
-from graph import State, build_graph
+# Import configuration
+from config.settings import API_TITLE, API_VERSION
+from config.database import mongo_client
 
-# Helper function to convert MongoDB documents to JSON-serializable format
-def mongo_to_json(data: Any) -> Any:
-    """
-    Recursively convert MongoDB documents to JSON-serializable format.
-    Handles ObjectId, datetime, and other non-serializable types.
-    """
-    if isinstance(data, dict):
-        return {key: mongo_to_json(value) for key, value in data.items()}
-    elif isinstance(data, list):
-        return [mongo_to_json(item) for item in data]
-    elif isinstance(data, ObjectId):
-        return str(data)
-    elif isinstance(data, datetime):
-        return data.isoformat()
-    elif hasattr(data, '__dict__'):
-        return mongo_to_json(data.__dict__)
-    else:
-        return data
-
-# Phone number helper function
-def normalize_phone_number(phone: str) -> str:
-    """
-    Normalize phone number by removing country code (91) if present.
-    Used throughout the system for consistency.
-    """
-    if not phone:
-        return phone
-
-    # Remove any non-digit characters
-    phone = ''.join(filter(str.isdigit, phone))
-
-    # Remove 91 prefix if present and number is longer than 10 digits
-    if phone.startswith('91') and len(phone) > 10:
-        return phone[2:]
-
-    return phone
-
-# Load environment variables
-load_dotenv(override=True)
+# Import service routers
+from services.erpService import router as erp_router
 
 # FastAPI app initialization
-app = FastAPI(title="AI Chatbot API", version="1.0.0")
+app = FastAPI(title=API_TITLE, version=API_VERSION)
 
 # CORS middleware
 app.add_middleware(
@@ -65,116 +21,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# MongoDB configuration
-MONGODB_URL = os.getenv("MONGODB_URL", "mongodb://app:jfudDUFIEPsddf4329KFNnn@qadb.odpay.in:27023/okiedokieERP?replicaSet=mdbqars0&authSource=admin")
-DATABASE_NAME = os.getenv("DATABASE_NAME", "okiedokieERP")
+# Register service routers
+app.include_router(erp_router)
 
-# MongoDB client - READ ONLY DATABASE
-# WARNING: This database is for READ operations only. Do NOT write, update, or delete any records.
-mongo_client = MongoClient(MONGODB_URL)
-db = mongo_client[DATABASE_NAME]
-# Collections for READ ONLY access
-students_collection = db["students"]  # READ ONLY
-users_collection = db["users"]  # READ ONLY
-communication_configs_collection = db["communicationconfigs"]  # READ ONLY
-
-# Request/Response models
-class ChatRequest(BaseModel):
-    query: str
-    fromNumber: str
-    toNumber: str
-
-class ChatResponse(BaseModel):
-    response: str
-    session_id: str
-    timestamp: datetime
-    tool_calls: Optional[List[Dict[str, Any]]] = None
-
-
-# Initialize the graph
-graph = build_graph()
-
-# Validation functions - READ ONLY operations
-def validate_user(from_number: str) -> Dict[str, Any]:
-    """
-    Validates user by checking students table first, then users table.
-    Returns user data with userType and entity.
-    READ ONLY - No modifications to database.
-    """
-    # Normalize phone number for database lookup (remove 91 if present)
-    normalized_phone = normalize_phone_number(from_number)
-
-    # Check students table first
-    student = students_collection.find_one({"phone": normalized_phone})
-    if student:
-        # Convert to JSON-serializable format
-        student_json = mongo_to_json(student)
-        return {
-            "userType": "student",  # Found in students table
-            "entity": student_json.get("entity", "student"),  # Get entity from student data or default to "student"
-            "phone": normalized_phone,  # Use only normalized phone throughout
-            "session": student_json.get("session"),
-            "data": student_json
-        }
-
-    # Check users table if not found in students
-    user = users_collection.find_one({"phone": normalized_phone})
-    if user:
-        # Convert to JSON-serializable format
-        user_json = mongo_to_json(user)
-        return {
-            "userType": "user",  # Found in users table
-            "entity": user_json.get("entity", "user"),  # Get entity from user data or default to "user"
-            "phone": normalized_phone,  # Use only normalized phone throughout
-            "session": None,
-            "data": user_json
-        }
-
-    # Not found in either table
-    return None
-
-def validate_communication_config(to_number: str) -> Dict[str, Any]:
-    """
-    Validates communication configuration for the given toNumber.
-    Returns the matching chatBotConfig or raises error if not found.
-    READ ONLY - No modifications to database.
-    """
-    # Find config document with matching senderPhone in chatBotConfig
-    config_doc = communication_configs_collection.find_one({
-        "chatBotConfig.senderPhone": to_number
-    })
-
-    if not config_doc:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No communication config document found for toNumber {to_number}"
-        )
-
-    # Convert to JSON-serializable format
-    config_doc_json = mongo_to_json(config_doc)
-
-    # Find specific chatBotConfig matching toNumber
-    chat_bot_configs = config_doc_json.get("chatBotConfig", [])
-    chat_bot_config = None
-
-    for config in chat_bot_configs:
-        if config.get("senderPhone") == to_number:
-            chat_bot_config = config
-            break
-
-    if not chat_bot_config:
-        raise HTTPException(
-            status_code=404,
-            detail=f"chatBotConfig not found for senderPhone {to_number} in communication config document"
-        )
-
-    return chat_bot_config
-
-# Session management - In-memory storage (no DB writes)
-# Using in-memory storage since we cannot write to the database
-conversation_sessions = {}
-
-# API Endpoints
+# Root endpoint
 @app.get("/")
 async def root():
     """
@@ -182,143 +32,11 @@ async def root():
     """
     return {
         "status": "online",
-        "service": "AI Chatbot API",
-        "version": "1.0.0"
+        "service": API_TITLE,
+        "version": API_VERSION
     }
 
-@app.post("/api/chat", response_model=ChatResponse)
-async def chat_endpoint(request: ChatRequest):
-    """
-    Main chat endpoint that processes messages through LangGraph.
-    Validates user and communication config before processing.
-    """
-    try:
-        # Step 1: Validate user (check students first, then users)
-        user_data = validate_user(request.fromNumber)
-        if not user_data:
-            raise HTTPException(
-                status_code=404,
-                detail=f"User with phone number {request.fromNumber} not found in students or users table"
-            )
-
-        # Step 2: Validate communication configuration (will raise HTTPException if not found)
-        chat_config = validate_communication_config(request.toNumber)
-
-        # Generate session ID based on fromNumber and toNumber
-        session_id = f"{request.fromNumber}_{request.toNumber}_{datetime.utcnow().strftime('%Y%m%d')}"
-
-        # Get conversation history from in-memory storage
-        history_messages = []
-        if session_id in conversation_sessions:
-            for conv in conversation_sessions[session_id][-10:]:  # Keep last 10 messages
-                history_messages.append(HumanMessage(content=conv["user_message"]))
-                history_messages.append(AIMessage(content=conv["bot_response"]))
-
-        # Add current query to messages
-        history_messages.append(HumanMessage(content=request.query))
-
-        # Prepare initial state with all required data
-        # Use normalized phone numbers throughout
-        initial_state = State(
-            messages=history_messages,
-            session_id=session_id,
-            user_data=user_data,
-            chat_config=chat_config,
-            from_number=normalize_phone_number(request.fromNumber),  # Use normalized phone
-            to_number=request.toNumber  # toNumber is already in correct format
-        )
-
-        # Invoke the graph
-        result = await graph.ainvoke(initial_state)
-
-        # Extract response - could be AIMessage or last message if tools were called
-        last_message = result['messages'][-1]
-        print(last_message)
-        if isinstance(last_message, ToolMessage):
-            # If last message is tool result, get the AI message before it
-            for msg in reversed(result['messages']):
-                if isinstance(msg, AIMessage):
-                    bot_response = msg.content
-                    break
-            else:
-                bot_response = "I processed your request but couldn't generate a response."
-        else:
-            bot_response = last_message.content if hasattr(last_message, 'content') else str(last_message)
-
-        tool_calls = result.get('tool_results')
-
-        # Store conversation in memory (no DB writes)
-        if session_id not in conversation_sessions:
-            conversation_sessions[session_id] = []
-
-        conversation_sessions[session_id].append({
-            "user_message": request.query,
-            "bot_response": bot_response,
-            "timestamp": datetime.utcnow(),
-            "tool_calls": tool_calls
-        })
-
-        # Keep only last 50 conversations per session in memory
-        if len(conversation_sessions[session_id]) > 50:
-            conversation_sessions[session_id] = conversation_sessions[session_id][-50:]
-
-        # Return response
-        return ChatResponse(
-            response=bot_response,
-            session_id=session_id,
-            timestamp=datetime.utcnow(),
-            tool_calls=tool_calls
-        )
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/conversations/{session_id}")
-async def get_conversation(session_id: str, limit: int = 10):
-    """
-    Retrieves conversation history for a given session from in-memory storage.
-    """
-    try:
-        if session_id not in conversation_sessions:
-            return {
-                "session_id": session_id,
-                "conversations": [],
-                "count": 0
-            }
-
-        conversations = conversation_sessions[session_id][-limit:]
-        return {
-            "session_id": session_id,
-            "conversations": conversations,
-            "count": len(conversations)
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.delete("/api/conversations/{session_id}")
-async def clear_conversation(session_id: str):
-    """
-    Clears conversation history from in-memory storage (no DB operations).
-    """
-    try:
-        if session_id in conversation_sessions:
-            count = len(conversation_sessions[session_id])
-            del conversation_sessions[session_id]
-            return {
-                "session_id": session_id,
-                "cleared_count": count,
-                "message": "Cleared from memory only (database is read-only)"
-            }
-        return {
-            "session_id": session_id,
-            "cleared_count": 0,
-            "message": "No conversation found in memory"
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
+# Health check endpoint
 @app.get("/health")
 async def health_check():
     """

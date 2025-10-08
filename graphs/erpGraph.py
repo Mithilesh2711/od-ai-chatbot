@@ -4,8 +4,9 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
-from tools import get_all_tools, get_tools_for_user_type, make_tool_call
-import os
+from tools.erpTools import get_all_tools, get_tools_for_user_type
+from tools.toolExecutor import make_tool_call
+from config.settings import OPENAI_MODEL
 import json
 
 # LangGraph State definition
@@ -22,7 +23,7 @@ class State(BaseModel):
 def get_llm_with_tools(user_type: str = None):
     """Initialize and return LLM with tools bound based on user type"""
     llm = ChatOpenAI(
-        model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+        model=OPENAI_MODEL,
         temperature=0.7
     )
 
@@ -53,7 +54,7 @@ async def chatbot_node(state: State) -> State:
     user_type = state.user_data.get("userType") if state.user_data else None
 
     # Add system message to guide tool selection based on user type
-    system_msg = SystemMessage(content=f"""You are an AI assistant for an educational institution's chatbot.
+    system_msg = SystemMessage(content=f"""You are a helpful AI assistant for an educational institution.
 
     Current user type: {user_type}
 
@@ -63,14 +64,15 @@ async def chatbot_node(state: State) -> State:
        - If user is a USER (admin/staff): Only use tools starting with 'user' (userFeeToday, userAdmOverall, etc.)
 
     2. CONFIDENCE THRESHOLD:
-       - If you are less than 50% confident about which tool to use, DO NOT call any tool.
-       - Instead, ask clarifying questions or suggest relevant options.
-       - Example: "I understand you're asking about fees. Could you please clarify:
-         • Do you want to check your personal fee dues?
-         • Do you want to see your payment history?
-         • Do you need information about fee structure?"
+       - Above 70% confident: Call tool directly
+       - 50-70% confident: Ask for confirmation first
+       - Below 50% confident: Provide short options (under 20 words)
 
-    3. If the query doesn't match any available tools for this user type, politely explain what you can help with.
+    3. For general queries, greetings, or non-tool conversations:
+       - Be polite, helpful, and conversational
+       - Keep responses relevant to educational context (fees, attendance, admissions)
+       - Respond naturally but stay within your domain
+       - Greetings and basic pleasantries are allowed
     """)
 
     # Create messages with system prompt
@@ -81,7 +83,7 @@ async def chatbot_node(state: State) -> State:
 
     # First, check confidence with a preliminary query
     confidence_check_llm = ChatOpenAI(
-        model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+        model=OPENAI_MODEL,
         temperature=0.1
     )
 
@@ -97,7 +99,7 @@ async def chatbot_node(state: State) -> State:
     {', '.join([tool.name for tool in get_tools_for_user_type(user_type)])}
 
     Respond in JSON format:
-    {{"intent": "description", "suggested_tool": "tool_name or null", "confidence": 0.0-1.0}}
+    {{"intent": "brief action description (under 10 words)", "suggested_tool": "tool_name or null", "confidence": 0.0-1.0}}
     """
 
     confidence_check = await confidence_check_llm.ainvoke([SystemMessage(content=confidence_prompt)])
@@ -114,26 +116,77 @@ async def chatbot_node(state: State) -> State:
     except:
         confidence_score = 0.5  # Default if parsing fails
 
-    # If confidence is too low, provide clarification instead of calling tools
-    if confidence_score < 0.5:
-        # Get available options for this user type
-        if user_type == "student":
-            options = """I can help you with:
-• **Fee Information**: Check your fee dues, payment history
-• **Attendance**: View today's attendance, weekly/monthly summary
+    # Handle confidence-based routing
+    if confidence_score > 0.7:
+        # High confidence - directly call the tool
+        response = await llm_with_tools.ainvoke(messages_with_context)
 
-Please specify what you'd like to know more clearly."""
-        elif user_type == "user":
-            options = """I can help you with:
-• **Fee Reports**: Today's collection, monthly summary, payment modes, dues by course
-• **Attendance Reports**: Overall attendance statistics
-• **Admission Reports**: Overall summary, course-wise, category-wise data
+    elif confidence_score >= 0.5:
+        # Medium confidence - provide a natural response instead of confirmation
+        context_llm = ChatOpenAI(
+            model=OPENAI_MODEL,
+            temperature=0.7
+        )
 
-Please specify which report or information you need."""
+        intent = confidence_data.get("intent", "") if 'confidence_data' in locals() else ""
+
+        # Check if it's a greeting
+        greeting_words = ['hi', 'hello', 'hey', 'greet', 'good morning', 'good afternoon', 'good evening']
+        is_greeting = any(word in intent.lower() for word in greeting_words) or \
+                     any(word in last_message.content.lower() for word in greeting_words)
+
+        if is_greeting:
+            # Handle greetings naturally
+            context_prompt = SystemMessage(content=f"""You are a helpful educational institution assistant.
+            User type: {user_type}
+
+            The user is greeting you. Respond warmly and briefly mention how you can help.
+            Keep response under 20 words and conversational.
+            Focus on educational services (fees, attendance, admissions).
+            """)
         else:
-            options = "Please clarify your request so I can assist you better."
+            # Handle other medium confidence cases
+            context_prompt = SystemMessage(content=f"""You are a helpful educational institution assistant.
+            User type: {user_type}
 
-        clarification_response = AIMessage(content=f"I'm not entirely sure what specific information you're looking for. {options}")
+            The user seems to be asking about: {intent}
+            Provide a helpful response or clarification.
+            Keep response under 20 words and conversational.
+            """)
+
+        messages_for_response = [context_prompt, last_message]
+        response = await context_llm.ainvoke(messages_for_response)
+
+        return State(
+            messages=[response],
+            session_id=state.session_id,
+            tool_results=None,
+            user_data=state.user_data,
+            chat_config=state.chat_config,
+            from_number=state.from_number,
+            to_number=state.to_number
+        )
+
+    else:
+        # Low confidence - provide context-aware conversational response
+        # Let LLM generate natural response based on context
+        context_llm = ChatOpenAI(
+            model=OPENAI_MODEL,
+            temperature=0.7
+        )
+
+        context_prompt = SystemMessage(content=f"""You are a helpful educational institution assistant.
+        User type: {user_type}
+
+        The user asked something but it's unclear. Respond naturally and helpfully:
+        - If greeting, respond warmly
+        - If unclear about educational services, briefly mention what you can help with
+        - Keep response under 20 words and conversational
+        - Stay within educational context (fees, attendance, admissions)
+        """)
+
+        messages_for_response = [context_prompt, last_message]
+        clarification_response = await context_llm.ainvoke(messages_for_response)
 
         return State(
             messages=[clarification_response],
@@ -145,12 +198,22 @@ Please specify which report or information you need."""
             to_number=state.to_number
         )
 
-    # Proceed with normal tool invocation if confidence is high enough
-    response = await llm_with_tools.ainvoke(messages_with_context)
+    # Continue with normal flow after confidence check
+    response = response if 'response' in locals() else await llm_with_tools.ainvoke(messages_with_context)
 
     # Check if tools were called
     tool_calls = []
     messages_to_add = [response]
+
+    # If no tool calls, ensure response is conversational and helpful
+    if not hasattr(response, 'tool_calls') or not response.tool_calls:
+        # Generate a natural, context-aware response
+        if confidence_score < 0.7 and confidence_score >= 0.5:
+            # Already handled in confirmation branch above
+            pass
+        else:
+            # Let the LLM respond naturally for non-tool queries
+            pass
 
     if hasattr(response, 'tool_calls') and response.tool_calls:
         for tool_call in response.tool_calls:
