@@ -8,6 +8,9 @@ from config.database import mongo_client
 
 # Import service routers
 from services.erpService import router as erp_router
+from services.vectorService import router as vector_router
+from services.scrapingService import router as scraping_router
+from services.leadsService import router as leads_router
 
 # FastAPI app initialization
 app = FastAPI(title=API_TITLE, version=API_VERSION)
@@ -23,6 +26,9 @@ app.add_middleware(
 
 # Register service routers
 app.include_router(erp_router)
+app.include_router(vector_router)
+app.include_router(scraping_router)
+app.include_router(leads_router)
 
 # Root endpoint
 @app.get("/")
