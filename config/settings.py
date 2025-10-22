@@ -8,7 +8,7 @@
 # =============================================================================
 
 # OpenAI Configuration
-OPENAI_API_KEY = ""
+OPENAI_API_KEY = "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"
 OPENAI_MODEL = "gpt-3.5-turbo"  # Default model for quick responses
 
 # Claude (Anthropic) Configuration
