@@ -67,7 +67,7 @@ class QdrantService:
 
     def _create_payload_indexes(self, collection_name: str):
         """
-        Create payload indexes for entity and session fields
+        Create payload indexes for entity field
 
         Args:
             collection_name: Name of the collection
@@ -84,28 +84,6 @@ class QdrantService:
             print(f"Created payload index for 'entity' field")
         except Exception as e:
             print(f"Index for 'entity' may already exist: {e}")
-
-        try:
-            # Create index for session field
-            client.create_payload_index(
-                collection_name=collection_name,
-                field_name="session",
-                field_schema="keyword"
-            )
-            print(f"Created payload index for 'session' field")
-        except Exception as e:
-            print(f"Index for 'session' may already exist: {e}")
-
-        try:
-            # Create index for source_type field
-            client.create_payload_index(
-                collection_name=collection_name,
-                field_name="source_type",
-                field_schema="keyword"
-            )
-            print(f"Created payload index for 'source_type' field")
-        except Exception as e:
-            print(f"Index for 'source_type' may already exist: {e}")
 
     def store_vectors(
         self,

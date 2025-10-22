@@ -10,8 +10,8 @@ class WebScraper:
 
     def __init__(
         self,
-        max_pages: int = 50,
-        max_depth: int = 3,
+        max_pages: int = 100,
+        max_depth: int = 10,
         timeout: int = 30000,
         headless: bool = True
     ):

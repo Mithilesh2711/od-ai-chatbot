@@ -1,101 +1,130 @@
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+"""
+Sentence window chunking service for RAG
+Replaces traditional chunking with sentence-level retrieval
+"""
 from typing import List, Dict, Any
-import tiktoken
+import re
+import uuid
+
 
 class ChunkingService:
-    """Service for chunking documents into smaller pieces"""
+    """Service for chunking documents using sentence window approach"""
 
     def __init__(
         self,
-        chunk_size: int = 512,
-        chunk_overlap: int = 50,
-        encoding_name: str = "cl100k_base"
+        window_size: int = 3,
     ):
         """
-        Initialize chunking service
+        Initialize sentence window chunking service
 
         Args:
-            chunk_size: Target size of each chunk in tokens
-            chunk_overlap: Number of tokens to overlap between chunks
-            encoding_name: Tokenizer encoding (cl100k_base for GPT-4/3.5)
+            window_size: Number of sentences to include before and after for context
         """
-        self.chunk_size = chunk_size
-        self.chunk_overlap = chunk_overlap
-        self.encoding = tiktoken.get_encoding(encoding_name)
+        self.window_size = window_size
 
-        # Initialize text splitter
-        self.text_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
-            encoding_name=encoding_name,
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
-            separators=["\n\n", "\n", ". ", " ", ""]
-        )
-
-    def chunk_text(self, text: str, metadata: Dict[str, Any] = None) -> List[Dict[str, Any]]:
+    def _split_into_sentences(self, text: str) -> List[str]:
         """
-        Chunk a single text document
+        Split text into sentences using regex
 
         Args:
-            text: The text to chunk
-            metadata: Optional metadata to attach to each chunk
+            text: Text to split
 
         Returns:
-            List of chunks with text and metadata
+            List of sentences
+        """
+        # Split on sentence boundaries (.!?) followed by whitespace
+        sentences = re.split(r'(?<=[.!?])\s+', text)
+        # Clean up empty sentences
+        sentences = [s.strip() for s in sentences if s.strip()]
+        return sentences
+
+    def chunk_text(
+        self,
+        text: str,
+        metadata: Dict[str, Any] = None,
+        parent_id: str = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Chunk text into sentence windows
+
+        Args:
+            text: Text to chunk
+            metadata: Metadata to attach to each chunk
+            parent_id: Parent document ID (generated if not provided)
+
+        Returns:
+            List of sentence window chunks
         """
         if not text or not text.strip():
             return []
 
-        # Split text into chunks
-        chunks = self.text_splitter.split_text(text)
+        # Generate parent ID if not provided
+        if parent_id is None:
+            parent_id = str(uuid.uuid4())
 
-        # Create chunk objects with metadata
-        chunk_objects = []
-        for idx, chunk in enumerate(chunks):
-            chunk_obj = {
-                "text": chunk,
-                "chunk_index": idx,
-                "total_chunks": len(chunks),
-                "metadata": metadata or {}
+        # Split into sentences
+        sentences = self._split_into_sentences(text)
+
+        if not sentences:
+            return []
+
+        chunks = []
+        for idx, sentence in enumerate(sentences):
+            # Get surrounding sentences for context window
+            start_idx = max(0, idx - self.window_size)
+            end_idx = min(len(sentences), idx + self.window_size + 1)
+
+            # Build context windows
+            window_before = ' '.join(sentences[start_idx:idx]) if idx > 0 else ''
+            window_after = ' '.join(sentences[idx + 1:end_idx]) if idx < len(sentences) - 1 else ''
+
+            # Create chunk with sentence window metadata
+            chunk_metadata = {
+                **(metadata or {}),
+                'parent_id': parent_id,
+                'sentence_index': idx,
+                'total_sentences': len(sentences),
+                'window_before': window_before,
+                'window_after': window_after
             }
-            chunk_objects.append(chunk_obj)
 
-        return chunk_objects
+            chunk = {
+                'text': sentence,  # Store only the sentence for embedding
+                'chunk_index': idx,
+                'total_chunks': len(sentences),
+                'metadata': chunk_metadata
+            }
+            chunks.append(chunk)
+
+        return chunks
 
     def chunk_documents(
         self,
         documents: List[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
         """
-        Chunk multiple documents
+        Chunk multiple documents using sentence window approach
 
         Args:
             documents: List of documents with 'text' and 'metadata' keys
 
         Returns:
-            List of all chunks from all documents
+            List of all sentence window chunks from all documents
         """
         all_chunks = []
 
         for doc in documents:
-            text = doc.get("text", "")
-            metadata = doc.get("metadata", {})
+            text = doc.get('text', '')
+            metadata = doc.get('metadata', {})
 
-            chunks = self.chunk_text(text, metadata)
+            # Generate unique parent ID for each document
+            parent_id = str(uuid.uuid4())
+
+            chunks = self.chunk_text(text, metadata, parent_id)
             all_chunks.extend(chunks)
 
         return all_chunks
 
-    def count_tokens(self, text: str) -> int:
-        """
-        Count the number of tokens in a text
-
-        Args:
-            text: The text to count tokens for
-
-        Returns:
-            Number of tokens
-        """
-        return len(self.encoding.encode(text))
 
 # Default chunking service instance
-chunking_service = ChunkingService()
+chunking_service = ChunkingService(window_size=3)

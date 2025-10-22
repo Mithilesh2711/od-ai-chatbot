@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, status, UploadFile, File, Query
+from fastapi import APIRouter, HTTPException, status, UploadFile, File, Query, Depends
 from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional
 from graphs.leadsGraph import leads_graph, LeadsState
@@ -7,13 +7,14 @@ from rag.chunking import chunking_service
 from vectorStore.embeddings import embedding_service
 from vectorStore.qdrantClient import qdrant_service
 from datetime import datetime
+from middleware.auth import jwt_auth
+from db.erpDb import get_entity_name
 
 router = APIRouter(prefix="/api/leads", tags=["Leads"])
 
 # Request/Response Models
 class ChatRequest(BaseModel):
     entity: str = Field(..., description="Entity identifier (e.g., 'college_mit', 'school_dps')")
-    session: str = Field(..., description="Session identifier for conversation tracking")
     query: str = Field(..., description="User's question")
 
 class RetrievedDocument(BaseModel):
@@ -26,7 +27,6 @@ class ChatResponse(BaseModel):
     success: bool
     answer: str
     entity: str
-    session: str
     query: str
     retrieved_docs_count: int
     retrieved_docs: List[RetrievedDocument]
@@ -36,7 +36,6 @@ class PDFUploadResponse(BaseModel):
     success: bool
     message: str
     entity: str
-    session: str
     filename: str
     pages_count: int
     chunks_created: int
@@ -47,102 +46,146 @@ class HealthResponse(BaseModel):
     status: str
     service: str
 
+# Core chat function that can be called directly
+async def process_chat(entity: str, query: str, model_name: str = None) -> Dict[str, Any]:
+    """
+    Core chat processing logic that can be reused.
+    Returns dict with answer, retrieved_docs, entity, and query.
+
+    Args:
+        entity: Entity identifier
+        query: User's question
+        model_name: Model name from chatBotConfig (e.g., 'gpt-3.5-turbo', 'claude-sonnet', 'gemini-pro')
+                    Falls back to DEFAULT_MODEL if not provided
+    """
+    import time
+    from graphs.leadsGraph import get_llm_instance
+    from config.settings import DEFAULT_MODEL
+
+    start_time = time.time()
+
+    # Validate inputs
+    if not entity or not entity.strip():
+        raise ValueError("Entity cannot be empty")
+
+    if not query or not query.strip():
+        raise ValueError("Query cannot be empty")
+
+    validation_time = time.time()
+    print(f"⏱️  Validation time: {validation_time - start_time:.3f}s")
+
+    # Use default model if not provided
+    if not model_name:
+        model_name = DEFAULT_MODEL
+        print(f"Using default model: {model_name}")
+    else:
+        print(f"Using model from chatBotConfig: {model_name}")
+
+    # Initialize LLM instance based on model_name
+    llm_init_start = time.time()
+    llm_instance = get_llm_instance(model_name)
+    llm_init_end = time.time()
+    print(f"⏱️  LLM initialization time: {llm_init_end - llm_init_start:.3f}s")
+
+    # Fetch entity name from entities collection
+    entity_name = get_entity_name(entity)
+    print(f"Entity name: {entity_name}")
+
+    # Initialize state with model_name and llm_instance
+    initial_state: LeadsState = {
+        "messages": [],
+        "entity": entity,
+        "entity_name": entity_name,
+        "query": query,
+        "retrieved_docs": [],
+        "answer": "",
+        "model_name": model_name,
+        "llm_instance": llm_instance
+    }
+
+    state_init_time = time.time()
+    print(f"⏱️  State initialization time: {state_init_time - validation_time:.3f}s")
+
+    # Invoke graph
+    print(f"Processing chat request for entity={entity}")
+    graph_start = time.time()
+    result = leads_graph.invoke(initial_state)
+    graph_end = time.time()
+    print(f"⏱️  Graph execution time: {graph_end - graph_start:.3f}s")
+
+    # Extract results
+    extract_start = time.time()
+    answer = result.get("answer", "")
+    retrieved_docs = result.get("retrieved_docs", [])
+
+    # Format retrieved documents
+    formatted_docs = []
+    for doc in retrieved_docs:
+        formatted_docs.append({
+            "score": doc["score"],
+            "text": doc["text"][:500] + "..." if len(doc["text"]) > 500 else doc["text"],
+            "url": doc["metadata"].get("url"),
+            "title": doc["metadata"].get("title")
+        })
+
+    format_end = time.time()
+    print(f"⏱️  Response formatting time: {format_end - extract_start:.3f}s")
+
+    total_time = time.time() - start_time
+    print(f"⏱️  🎯 TOTAL REQUEST TIME: {total_time:.3f}s")
+
+    return {
+        "answer": answer,
+        "retrieved_docs": formatted_docs,
+        "entity": entity,
+        "entity_name": entity_name,
+        "query": query,
+        "retrieved_docs_count": len(retrieved_docs)
+    }
+
 @router.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
     """
     Chat with AI agent using entity-specific knowledge base
 
     This endpoint:
-    1. Retrieves relevant documents from the vector DB filtered by entity and session
+    1. Retrieves relevant documents from the vector DB filtered by entity
     2. Uses LangGraph agent to generate contextual responses
     3. Returns the answer along with source documents
 
     - **entity**: Entity identifier (e.g., "college_mit", "school_dps_rkpuram")
-    - **session**: Session ID to filter specific scraped data
     - **query**: User's question about the entity
     """
-    import time
-    start_time = time.time()
-
     try:
-        # Validate inputs
-        if not request.entity or not request.entity.strip():
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Entity cannot be empty"
+        # Call core chat processing function
+        result = await process_chat(request.entity, request.query)
+
+        # Convert retrieved_docs to RetrievedDocument models
+        formatted_docs = [
+            RetrievedDocument(
+                score=doc["score"],
+                text=doc["text"],
+                url=doc.get("url"),
+                title=doc.get("title")
             )
-
-        if not request.session or not request.session.strip():
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Session cannot be empty"
-            )
-
-        if not request.query or not request.query.strip():
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Query cannot be empty"
-            )
-
-        validation_time = time.time()
-        print(f"⏱️  Validation time: {validation_time - start_time:.3f}s")
-
-        # Initialize state
-        initial_state: LeadsState = {
-            "messages": [],
-            "entity": request.entity,
-            "session": request.session,
-            "query": request.query,
-            "retrieved_docs": [],
-            "answer": ""
-        }
-
-        state_init_time = time.time()
-        print(f"⏱️  State initialization time: {state_init_time - validation_time:.3f}s")
-
-        # Invoke graph
-        print(f"Processing chat request for entity={request.entity}, session={request.session}")
-        graph_start = time.time()
-        result = leads_graph.invoke(initial_state)
-        graph_end = time.time()
-        print(f"⏱️  Graph execution time: {graph_end - graph_start:.3f}s")
-
-        # Extract results
-        extract_start = time.time()
-        answer = result.get("answer", "")
-        retrieved_docs = result.get("retrieved_docs", [])
-
-        # Format retrieved documents
-        formatted_docs = []
-        for doc in retrieved_docs:
-            formatted_docs.append(
-                RetrievedDocument(
-                    score=doc["score"],
-                    text=doc["text"][:500] + "..." if len(doc["text"]) > 500 else doc["text"],
-                    url=doc["metadata"].get("url"),
-                    title=doc["metadata"].get("title")
-                )
-            )
-
-        format_end = time.time()
-        print(f"⏱️  Response formatting time: {format_end - extract_start:.3f}s")
-
-        total_time = time.time() - start_time
-        print(f"⏱️  🎯 TOTAL REQUEST TIME: {total_time:.3f}s")
+            for doc in result["retrieved_docs"]
+        ]
 
         return ChatResponse(
             success=True,
-            answer=answer,
-            entity=request.entity,
-            session=request.session,
-            query=request.query,
-            retrieved_docs_count=len(retrieved_docs),
+            answer=result["answer"],
+            entity=result["entity"],
+            query=result["query"],
+            retrieved_docs_count=result["retrieved_docs_count"],
             retrieved_docs=formatted_docs,
             timestamp=datetime.utcnow().isoformat()
         )
 
-    except HTTPException:
-        raise
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
     except Exception as e:
         print(f"Error in chat endpoint: {str(e)}")
         raise HTTPException(
@@ -150,23 +193,24 @@ async def chat(request: ChatRequest):
             detail=f"Error processing chat request: {str(e)}"
         )
 
-@router.post("/upload-pdf", response_model=PDFUploadResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/uploadPdf", response_model=PDFUploadResponse, status_code=status.HTTP_201_CREATED)
 async def upload_pdf(
     entity: str = Query(..., description="Entity identifier (e.g., 'college_mit')"),
-    session: str = Query(..., description="Session identifier"),
-    file: UploadFile = File(..., description="PDF file to upload")
+    file: UploadFile = File(..., description="PDF file to upload"),
+    auth_data: dict = Depends(jwt_auth.verify_token)
 ):
     """
     Upload PDF brochure and store in vector database
 
+    **Authentication Required**: This endpoint requires a valid JWT token in the Authorization header.
+
     This endpoint:
     1. Extracts text from PDF file
-    2. Chunks the content
-    3. Generates embeddings
+    2. Chunks the content into sentence windows
+    3. Generates embeddings for each sentence
     4. Stores in vector DB with source_type='pdf'
 
     - **entity**: Entity identifier (query param)
-    - **session**: Session identifier (query param)
     - **file**: PDF file (form data)
     """
     try:
@@ -177,12 +221,6 @@ async def upload_pdf(
                 detail="Entity cannot be empty"
             )
 
-        if not session or not session.strip():
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Session cannot be empty"
-            )
-
         # Validate file type
         if not file.filename.lower().endswith('.pdf'):
             raise HTTPException(
@@ -190,7 +228,7 @@ async def upload_pdf(
                 detail="Only PDF files are supported"
             )
 
-        print(f"Processing PDF upload: {file.filename} for entity={entity}, session={session}")
+        print(f"Processing PDF upload: {file.filename} for entity={entity}")
 
         # Read file content
         file_content = await file.read()
@@ -221,7 +259,6 @@ async def upload_pdf(
             "metadata": {
                 "source_type": "pdf",
                 "entity": entity,
-                "session": session,
                 "filename": file.filename,
                 "num_pages": pdf_metadata["num_pages"],
                 "title": pdf_metadata.get("title", file.filename)
@@ -257,7 +294,7 @@ async def upload_pdf(
         embeddings = embedding_service.generate_embeddings(texts)
 
         # Store in vector database
-        print(f"Storing vectors in collection for entity={entity}, session={session}")
+        print(f"Storing vectors in collection for entity={entity}")
         point_ids = qdrant_service.store_vectors(
             texts=texts,
             embeddings=embeddings,
@@ -269,7 +306,6 @@ async def upload_pdf(
             success=True,
             message=f"Successfully processed PDF and stored {len(point_ids)} vectors",
             entity=entity,
-            session=session,
             filename=file.filename,
             pages_count=pdf_metadata["num_pages"],
             chunks_created=len(chunks),

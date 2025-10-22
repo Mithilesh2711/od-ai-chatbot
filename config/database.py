@@ -10,3 +10,4 @@ db = mongo_client[DATABASE_NAME]
 students_collection = db["students"]  # READ ONLY
 users_collection = db["users"]  # READ ONLY
 communication_configs_collection = db["communicationconfigs"]  # READ ONLY
+entities_collection = db["entities"]  # READ ONLY

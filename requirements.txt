@@ -1,7 +1,6 @@
 # Core FastAPI & Web
 fastapi==0.115.12
 uvicorn[standard]==0.34.3
-python-dotenv==1.1.0
 pydantic==2.11.5
 pydantic-core==2.33.2
 python-multipart==0.0.20
@@ -17,6 +16,8 @@ pymongo==4.15.0
 langchain==0.3.25
 langchain-core==0.3.64
 langchain-openai==0.3.21
+langchain-anthropic==0.3.10
+langchain-google-genai==2.0.9
 langchain-community==0.3.24
 langchain-text-splitters==0.3.8
 langgraph==0.4.8
@@ -28,6 +29,9 @@ openai==1.85.0
 
 # Vector Store & Embeddings
 qdrant-client==1.12.1
+
+# RAG Enhancements (optional but recommended)
+cohere==5.13.4  # For reranking - falls back to score-based if not installed
 
 # Web Scraping
 playwright==1.52.0
@@ -45,3 +49,6 @@ certifi==2025.4.26
 charset-normalizer==3.4.2
 idna==3.10
 urllib3==2.4.0
+
+# Authentication
+PyJWT==2.8.0

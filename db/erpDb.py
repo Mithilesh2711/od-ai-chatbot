@@ -1,6 +1,7 @@
 from typing import Dict, Any, Optional
 from fastapi import HTTPException
-from config.database import students_collection, users_collection, communication_configs_collection
+from bson import ObjectId
+from config.database import students_collection, users_collection, communication_configs_collection, entities_collection
 from utils.helpers import mongo_to_json, normalize_phone_number
 
 def get_student_by_phone(phone: str) -> Optional[Dict[str, Any]]:
@@ -101,3 +102,31 @@ def validate_communication_config(to_number: str) -> Dict[str, Any]:
         )
 
     return chat_bot_config
+
+def get_entity_name(entity_id: str) -> str:
+    """
+    Get entity name by entity _id.
+    Returns entity name or the entity_id if not found.
+    READ ONLY - No modifications to database.
+    """
+    try:
+        # Convert string to ObjectId
+        object_id = ObjectId(entity_id)
+
+        # Find entity by _id
+        entity = entities_collection.find_one({"_id": object_id})
+
+        if entity:
+            # Return entity name (check common field names)
+            entity_name = entity.get("name") or entity.get("entityName") or entity.get("title")
+            if entity_name:
+                return entity_name
+
+        # If not found or no name field, return the entity_id itself
+        print(f"Warning: Entity name not found for entity_id: {entity_id}")
+        return entity_id
+
+    except Exception as e:
+        print(f"Error fetching entity name for {entity_id}: {str(e)}")
+        # Return entity_id as fallback
+        return entity_id

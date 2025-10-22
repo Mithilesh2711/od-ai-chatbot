@@ -1,8 +1,9 @@
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, status, Depends
 from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional
 from vectorStore.embeddings import embedding_service
 from vectorStore.qdrantClient import qdrant_service
+from middleware.auth import jwt_auth
 
 router = APIRouter(prefix="/api/vector", tags=["Vector"])
 
@@ -173,6 +174,51 @@ async def delete_vectors(request: DeleteRequest):
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error deleting vectors: {str(e)}"
+        )
+
+@router.delete("/deleteEntity/{entity}", response_model=DeleteResponse)
+async def delete_entity_vectors(
+    entity: str,
+    collection_name: Optional[str] = None,
+    auth_data: dict = Depends(jwt_auth.verify_token)
+):
+    """
+    Delete all vectors for a specific entity
+
+    **Authentication Required**: This endpoint requires a valid JWT token in the Authorization header.
+
+    This endpoint will delete all vectors (from web scraping, PDF uploads, etc.)
+    associated with the specified entity.
+
+    - **entity**: Entity identifier to delete all vectors for (e.g., "college_mit", "school_dps")
+    - **collection_name**: Optional collection name (uses default if not provided)
+    """
+    try:
+        if not entity or not entity.strip():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Entity cannot be empty"
+            )
+
+        # Delete all vectors with this entity
+        filters = {"entity": entity}
+
+        qdrant_service.delete_by_filter(
+            filters=filters,
+            collection_name=collection_name
+        )
+
+        return DeleteResponse(
+            success=True,
+            message=f"Successfully deleted all vectors for entity: {entity}"
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error deleting entity vectors: {str(e)}"
         )
 
 @router.get("/collections/{collection_name}", response_model=CollectionInfoResponse)
