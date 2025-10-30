@@ -94,3 +94,16 @@ MTALKZ_ACCESS_TOKEN = ""  # Add your mTalkz access token
 # JWT Authentication Configuration
 JWT_SECRET_KEY = "thesecrettopayismoney"  # Change this to a secure secret key
 JWT_ALGORITHM = "HS256"
+
+# PostgreSQL Configuration for Chat Memory
+POSTGRES_URL = "postgresql://postgres:Sittu2711@db.sacbiiolerutbchkjxrz.supabase.co:5432/postgres"  # Update with your PostgreSQL connection
+
+# Chat Memory Configuration
+ENABLE_CHAT_MEMORY = True
+SLIDING_WINDOW_SIZE = 20  # Keep last 20 messages in memory (10 user + 10 AI)
+
+# =============================================================================
+# Multilingual Translation Configuration
+# =============================================================================
+ENABLE_MULTILINGUAL = True  # Enable Hindi, English, and Hinglish support
+# Translation uses the same LLM instance as the RAG pipeline (model_name from chatBotConfig)

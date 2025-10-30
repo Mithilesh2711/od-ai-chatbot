@@ -1,10 +1,11 @@
 from typing import TypedDict, List, Dict, Any, Annotated, Optional
-from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
+from langchain_core.messages import HumanMessage, AIMessage, BaseMessage, RemoveMessage
 from langchain_openai import ChatOpenAI
 from langchain_anthropic import ChatAnthropic
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
+from langgraph.checkpoint.postgres import PostgresSaver
 from vectorStore.qdrantClient import qdrant_service
 from vectorStore.embeddings import embedding_service
 from config import settings
@@ -19,12 +20,109 @@ class LeadsState(TypedDict):
     entity: str
     entity_name: Optional[str]
     query: str
+    query_type: Optional[str]  # "general", "chat_history", "rag"
+    confidence_score: Optional[float]  # 0.0 to 1.0
     query_variations: Optional[List[str]]
     hypothetical_doc: Optional[str]
     retrieved_docs: List[Dict[str, Any]]
     answer: str
+    needs_rag: Optional[bool]  # Whether RAG retrieval is needed
     model_name: Optional[str]  # Model name from chatBotConfig
     llm_instance: Optional[Any]  # LLM instance created from model_name
+
+def classify_query_node(state: LeadsState) -> LeadsState:
+    """
+    Classify query to determine if RAG retrieval is needed.
+    Checks if query is:
+    1. General query (greeting, thanks, small talk) - confidence > 0.8
+    2. Can be answered from chat history - confidence > 0.8
+    3. Needs RAG retrieval - confidence < 0.8
+    """
+    import time
+    node_start = time.time()
+
+    query = state["query"]
+    messages = state["messages"]
+    llm = state.get("llm_instance")
+
+    if not llm:
+        llm = get_llm_instance()
+
+    print(f"  ℹ️  [CLASSIFY] Classifying query: {query[:50]}...")
+
+    # Build conversation context for classification
+    chat_context = ""
+    if messages:
+        recent_messages = messages[-6:]  # Last 3 exchanges
+        for msg in recent_messages:
+            role = "User" if isinstance(msg, HumanMessage) else "Assistant"
+            chat_context += f"{role}: {msg.content}\n"
+
+    classification_prompt = f"""Analyze this query and determine its type and confidence score.
+
+Query: "{query}"
+
+Recent conversation:
+{chat_context if chat_context else "No previous conversation"}
+
+Classify as ONE of:
+1. GENERAL - Greetings, thanks, small talk, yes/no responses (e.g., "hi", "thanks", "okay", "yes", "hello")
+2. CHAT_HISTORY - Can be answered from the conversation history above (e.g., "what did you say?", "repeat that", "tell me more about what you mentioned")
+3. RAG_NEEDED - Requires looking up specific information (e.g., "what are the fees?", "admission requirements", "courses offered")
+
+Respond in this EXACT format:
+TYPE: [GENERAL/CHAT_HISTORY/RAG_NEEDED]
+CONFIDENCE: [0.0-1.0]
+REASON: [brief explanation]"""
+
+    try:
+        response = llm.invoke([{"role": "user", "content": classification_prompt}])
+        classification_text = response.content
+
+        # Parse classification
+        query_type = "rag"  # default
+        confidence = 0.5  # default
+        needs_rag = True
+
+        if "TYPE:" in classification_text:
+            type_line = [line for line in classification_text.split('\n') if 'TYPE:' in line][0]
+            if "GENERAL" in type_line.upper():
+                query_type = "general"
+            elif "CHAT_HISTORY" in type_line.upper():
+                query_type = "chat_history"
+            else:
+                query_type = "rag"
+
+        if "CONFIDENCE:" in classification_text:
+            conf_line = [line for line in classification_text.split('\n') if 'CONFIDENCE:' in line][0]
+            try:
+                confidence = float(conf_line.split(':')[1].strip())
+            except:
+                confidence = 0.5
+
+        # Determine if RAG is needed
+        if query_type in ["general", "chat_history"] and confidence > 0.8:
+            needs_rag = False
+
+        node_end = time.time()
+        print(f"  ✓ [CLASSIFY] Type: {query_type}, Confidence: {confidence:.2f}, Needs RAG: {needs_rag}")
+        print(f"  ⏱️  [CLASSIFY] Total node time: {node_end - node_start:.3f}s")
+
+        return {
+            **state,
+            "query_type": query_type,
+            "confidence_score": confidence,
+            "needs_rag": needs_rag
+        }
+
+    except Exception as e:
+        print(f"  ⚠️  [CLASSIFY] Classification failed: {e}, defaulting to RAG")
+        return {
+            **state,
+            "query_type": "rag",
+            "confidence_score": 0.5,
+            "needs_rag": True
+        }
 
 def get_llm_instance(model_name: str = None):
     """
@@ -356,9 +454,33 @@ def expand_context_node(state: LeadsState) -> LeadsState:
         print(f"  ℹ️  [EXPAND_CONTEXT] Continuing with original documents")
         return state
 
+def trim_messages_sliding_window(messages: List[BaseMessage]) -> List[BaseMessage]:
+    """
+    Trim messages using sliding window technique.
+    Keeps only the last N messages based on SLIDING_WINDOW_SIZE.
+
+    Args:
+        messages: List of messages to trim
+
+    Returns:
+        Trimmed list of messages and list of messages to remove
+    """
+    if not settings.ENABLE_CHAT_MEMORY:
+        return messages
+
+    window_size = settings.SLIDING_WINDOW_SIZE
+
+    # If messages are within window size, return as is
+    if len(messages) <= window_size:
+        return messages
+
+    # Keep only last N messages
+    print(f"  📊 [MEMORY] Trimming messages: {len(messages)} -> {window_size} (sliding window)")
+    return messages[-window_size:]
+
 def generate_node(state: LeadsState) -> LeadsState:
     """
-    Generate response using retrieved documents as context
+    Generate response based on query type and context
     """
     import time
     node_start = time.time()
@@ -367,6 +489,8 @@ def generate_node(state: LeadsState) -> LeadsState:
     retrieved_docs = state["retrieved_docs"]
     entity = state["entity"]
     entity_name = state.get("entity_name") or entity
+    query_type = state.get("query_type", "rag")
+    needs_rag = state.get("needs_rag", True)
 
     # Get LLM instance from state
     llm = state.get("llm_instance")
@@ -374,61 +498,69 @@ def generate_node(state: LeadsState) -> LeadsState:
         print("  ⚠️  [GENERATE] No LLM instance in state, using default")
         llm = get_llm_instance()
 
-    # Build context from retrieved documents
+    # Trim messages using sliding window before adding new ones
+    current_messages = state["messages"]
+    if settings.ENABLE_CHAT_MEMORY and len(current_messages) > 0:
+        current_messages = trim_messages_sliding_window(current_messages)
+
+    # Build context from retrieved documents (only if RAG was performed)
     context_start = time.time()
-    if retrieved_docs:
+    context = ""
+    if needs_rag and retrieved_docs:
         context_parts = []
         for idx, doc in enumerate(retrieved_docs, 1):
             context_parts.append(
-                f"Document {idx} (Score: {doc['score']:.3f}):\n"
-                f"Source: {doc['metadata'].get('url', 'N/A')}\n"
-                f"Content: {doc['text']}\n"
+                f"Document {idx}:\n{doc['text']}\n"
             )
         context = "\n---\n".join(context_parts)
-    else:
-        context = "No relevant information found in the knowledge base."
     context_end = time.time()
     print(f"  ⏱️  [GENERATE] Context building: {context_end - context_start:.3f}s")
 
-    # Create system prompt
+    # Create system prompt based on query type
     prompt_start = time.time()
-    system_prompt = f"""You are a representative from {entity_name} communicating via WhatsApp with prospective students and families.
 
-Communication Style:
-- Respond naturally and conversationally, as if you're a staff member from the institution
-- Keep messages concise and WhatsApp-friendly (avoid long paragraphs)
-- Use a warm, welcoming, and professional tone
-- Never mention AI, context, documents, or data sources - just respond as the institution
+    # Different prompts for different query types
+    if query_type == "general":
+        system_prompt = f"""You are a friendly representative from {entity_name}.
+Keep responses brief, warm, and natural. This is a WhatsApp conversation."""
 
-When You Have Information:
-- Provide clear, accurate answers directly
-- Share relevant details about programs, admissions, facilities, fees, etc.
-- Be specific with numbers, dates, and requirements when available
+    elif query_type == "chat_history":
+        system_prompt = f"""You are a representative from {entity_name}.
+Answer based on what was already discussed in this conversation.
+Keep responses concise and conversational."""
 
-When You Don't Have Information:
-- guide them: "For that information, please call our office"
-- Never say things like "based on the provided context" or "I don't have that in my database"
+    else:  # RAG query
+        system_prompt = f"""You are a representative from {entity_name}.
 
-Important:
-- Respond as {entity_name} itself, not as an assistant or bot
-- Keep the conversation natural and human-like
-- If asked about sensitive matters (admissions decisions, personal records), direct them to contact the appropriate office directly"""
+CRITICAL RULES:
+1. ONLY use information from the Knowledge Base below
+2. If information is NOT in the Knowledge Base, say: "I don't have that information. Please contact our office at [office number/email] for details."
+3. NEVER make up names, numbers, or details
+4. NEVER use placeholders like [Name], [Number], [Details]
+5. Be brief - 2-3 sentences maximum
+6. Don't end with "contact us" or "feel free to ask" unless no information found
 
-    # Create user prompt with context
-    user_prompt = f"""Context from knowledge base:
-{context}
+Knowledge Base:
+{context if context else "No relevant information available."}
 
-Question: {query}
+If Knowledge Base is empty or doesn't answer the question, be honest and direct them to contact the office."""
 
-Please provide a helpful answer based on the context above. This will be whatsapped to the user so keep it concise and clear."""
+    # Convert conversation history to LLM format
+    messages = [{"role": "system", "content": system_prompt}]
 
-    # Generate response
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt}
-    ]
+    # Add conversation history (if exists)
+    for msg in current_messages:
+        if isinstance(msg, HumanMessage):
+            messages.append({"role": "user", "content": msg.content})
+        elif isinstance(msg, AIMessage):
+            messages.append({"role": "assistant", "content": msg.content})
+
+    # Add current query
+    messages.append({"role": "user", "content": query})
+
     prompt_end = time.time()
     print(f"  ⏱️  [GENERATE] Prompt creation: {prompt_end - prompt_start:.3f}s")
+    print(f"  📝 [GENERATE] Query type: {query_type}, Using {len(current_messages)} previous messages")
 
     llm_start = time.time()
     response = llm.invoke(messages)
@@ -436,11 +568,20 @@ Please provide a helpful answer based on the context above. This will be whatsap
     llm_end = time.time()
     print(f"  ⏱️  [GENERATE] LLM API call: {llm_end - llm_start:.3f}s")
 
+    # Validate response for hallucinations
+    if query_type == "rag" and ('[' in answer or 'Name of' in answer or 'please contact our office directly for accurate information' in answer.lower()):
+        print(f"  ⚠️  [GENERATE] Possible hallucination detected, cleaning response...")
+        # Remove placeholder patterns
+        import re
+        answer = re.sub(r'\[.*?\]', '', answer)
+        if not answer.strip() or len(answer.strip()) < 20:
+            answer = "I don't have specific information about that. Please contact our office for accurate details."
+
     print(f"Generated answer: {answer[:200]}...")
 
-    # Update messages
+    # Update messages with trimmed history
     message_start = time.time()
-    updated_messages = state["messages"] + [
+    updated_messages = current_messages + [
         HumanMessage(content=query),
         AIMessage(content=answer)
     ]
@@ -456,17 +597,109 @@ Please provide a helpful answer based on the context above. This will be whatsap
         "answer": answer
     }
 
+def get_postgres_checkpointer():
+    """
+    Initialize PostgresSaver for chat memory persistence.
+    Creates connection pool and sets up checkpoint tables.
+    """
+    if not settings.ENABLE_CHAT_MEMORY:
+        print("[!] Chat memory disabled in settings")
+        return None
+
+    try:
+        from psycopg_pool import ConnectionPool
+        import socket
+
+        # Create PostgreSQL connection
+        connection_string = settings.POSTGRES_URL
+
+        print(f"[+] Initializing PostgreSQL checkpointer")
+        print(f"    Connection: {connection_string.split('@')[-1] if '@' in connection_string else 'local'}")
+
+        # Test DNS resolution first
+        # try:
+        #     hostname = connection_string.split('@')[1].split(':')[0]
+        #     print(f"[+] Testing DNS resolution for: {hostname}")
+        #     ip = socket.gethostbyname(hostname)
+        #     print(f"[+] DNS resolved to: {ip}")
+        # except socket.gaierror as dns_error:
+        #     print(f"[!] DNS resolution failed: {dns_error}")
+        #     print(f"[!] Check your internet connection and DNS settings")
+        #     print(f"[!] Continuing without chat memory (stateless mode)")
+        #     return None
+
+        # Create connection pool with timeout and lazy opening
+        pool = ConnectionPool(
+            conninfo=connection_string,
+            min_size=1,  # Minimum connections
+            max_size=20,  # Maximum connections
+            open=False,  # Don't open connections immediately
+            timeout=10.0,  # Connection timeout
+            kwargs={
+                "autocommit": True,
+                "prepare_threshold": 0,
+                "connect_timeout": 10,
+            }
+        )
+
+        # Open the pool (creates initial connections)
+        print(f"[+] Opening connection pool...")
+        pool.open()
+
+        # Create checkpointer with pool
+        checkpointer = PostgresSaver(pool)
+
+        # Setup tables (creates if not exists)
+        print(f"[+] Setting up checkpoint tables...")
+        with pool.connection() as conn:
+            checkpointer.setup()
+
+        print(f"[✓] PostgreSQL checkpointer initialized successfully")
+        print(f"[+] Chat Memory: Sliding window enabled (last {settings.SLIDING_WINDOW_SIZE} messages)")
+
+        return checkpointer
+
+    except Exception as e:
+        print(f"[!] Failed to initialize PostgreSQL checkpointer: {e}")
+        print(f"[!] Continuing without chat memory (stateless mode)")
+        import traceback
+        traceback.print_exc()
+        return None
+
+def route_after_classification(state: LeadsState) -> str:
+    """
+    Route based on query classification.
+    If needs_rag is False, skip directly to generate.
+    Otherwise, proceed with RAG pipeline.
+    """
+    needs_rag = state.get("needs_rag", True)
+    if needs_rag:
+        # Go through RAG pipeline
+        if settings.ENABLE_QUERY_TRANSFORMATION:
+            return "query_transform"
+        else:
+            return "retrieve"
+    else:
+        # Skip RAG, go directly to generate
+        return "generate"
+
 def build_leads_graph():
     """
     Build and compile the leads chat graph
 
-    Flow (with enhancements):
-    START → [query_transform] → retrieve → [rerank] → [expand_context] → generate → END
+    Flow (with query classification):
+    START → classify →
+        if needs_rag: [query_transform] → retrieve → [rerank] → [expand_context] → generate → END
+        else: generate → END
 
     Nodes in brackets are optional based on config flags
     """
     # Create graph
     workflow = StateGraph(LeadsState)
+
+    # Add query classification node (first step)
+    workflow.add_node("classify", classify_query_node)
+    print("[+] Query Classification: Enabled (detects general/chat queries)")
 
     # Add core nodes
     workflow.add_node("retrieve", retrieve_node)
@@ -488,32 +721,49 @@ def build_leads_graph():
         print("[+] RAG Enhancement: Sentence window expansion enabled")
 
     # Define edges based on enabled features
-    # 1. START → query_transform (if enabled) OR retrieve
-    if settings.ENABLE_QUERY_TRANSFORMATION:
-        workflow.add_edge(START, "query_transform")
-        workflow.add_edge("query_transform", "retrieve")
-    else:
-        workflow.add_edge(START, "retrieve")
+    # 1. START → classify (always first)
+    workflow.add_edge(START, "classify")
 
-    # 2. retrieve → rerank (if enabled) OR next step
+    # 2. classify → conditional routing
+    workflow.add_conditional_edges(
+        "classify",
+        route_after_classification,
+        {
+            "query_transform": "query_transform",
+            "retrieve": "retrieve",
+            "generate": "generate"
+        }
+    )
+
+    # 3. query_transform → retrieve (if query transformation enabled)
+    if settings.ENABLE_QUERY_TRANSFORMATION:
+        workflow.add_edge("query_transform", "retrieve")
+
+    # 4. retrieve → rerank (if enabled) OR next step
     if settings.ENABLE_RERANKING:
         workflow.add_edge("retrieve", "rerank")
         last_node = "rerank"
     else:
         last_node = "retrieve"
 
-    # 3. Last node → expand_context (if enabled) OR generate
+    # 5. Last node → expand_context (if enabled) OR generate
     if settings.ENABLE_SENTENCE_WINDOW:
         workflow.add_edge(last_node, "expand_context")
         workflow.add_edge("expand_context", "generate")
     else:
         workflow.add_edge(last_node, "generate")
 
-    # 4. generate → END
+    # 6. generate → END (always)
     workflow.add_edge("generate", END)
 
-    # Compile
-    graph = workflow.compile()
+    # Initialize checkpointer if chat memory is enabled
+    checkpointer = get_postgres_checkpointer()
+
+    # Compile with or without checkpointer
+    if checkpointer:
+        graph = workflow.compile(checkpointer=checkpointer)
+    else:
+        graph = workflow.compile()
 
     return graph
 

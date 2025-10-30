@@ -282,9 +282,15 @@ async def mtalkz_webhook(request: WebhookRequest):
 
         print(f"Found {user_type} with entity: {entity}")
 
-        # Call leads service process_chat function directly with model_name
+        # Call leads service process_chat function directly with model_name and phone_number
+        # phone_number is used for thread_id to maintain conversation history
         # This will fetch entity_name internally (only once)
-        chat_result = await process_chat(entity, user_query, model_name=model_name)
+        chat_result = await process_chat(
+            entity=entity,
+            query=user_query,
+            model_name=model_name,
+            phone_number=from_phone
+        )
 
         answer = chat_result.get("answer", "")
         entity_name = chat_result.get("entity_name", entity)
@@ -364,8 +370,12 @@ async def test_chat(request: ChatTestRequest):
         entity = user_data["entity"]
         user_type = user_data["userType"]
 
-        # Call leads service process_chat function directly
-        chat_result = await process_chat(entity, request.query)
+        # Call leads service process_chat function directly with phone_number for memory
+        chat_result = await process_chat(
+            entity=entity,
+            query=request.query,
+            phone_number=request.phone
+        )
 
         answer = chat_result.get("answer", "No response generated")
 
