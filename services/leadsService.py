@@ -17,6 +17,11 @@ router = APIRouter(prefix="/api/leads", tags=["Leads"])
 class ChatRequest(BaseModel):
     entity: str = Field(..., description="Entity identifier (e.g., 'college_mit', 'school_dps')")
     query: str = Field(..., description="User's question")
+    # Optional webhook fields from ERP
+    fromNumber: Optional[str] = Field(None, description="User phone number (for webhook)")
+    toNumber: Optional[str] = Field(None, description="Bot phone number (for webhook)")
+    accessToken: Optional[str] = Field(None, description="mTalkz access token (for webhook)")
+    model: Optional[str] = Field(None, description="Chatbot model name (for webhook)")
 
 class RetrievedDocument(BaseModel):
     score: float
@@ -217,13 +222,26 @@ async def chat(request: ChatRequest):
     1. Retrieves relevant documents from the vector DB filtered by entity
     2. Uses LangGraph agent to generate contextual responses
     3. Returns the answer along with source documents
+    4. If webhook fields provided (fromNumber, toNumber, accessToken), sends WhatsApp message
 
     - **entity**: Entity identifier (e.g., "college_mit", "school_dps_rkpuram")
     - **query**: User's question about the entity
+    - **fromNumber** (optional): User phone for webhook + thread_id
+    - **toNumber** (optional): Bot phone for webhook
+    - **accessToken** (optional): mTalkz token for webhook
+    - **model** (optional): Model name for webhook
     """
     try:
-        # Call core chat processing function
-        result = await process_chat(request.entity, request.query)
+        # Check if this is a webhook request (has fromNumber, toNumber, accessToken)
+        is_webhook = bool(request.fromNumber and request.toNumber and request.accessToken)
+
+        # Call core chat processing function with model and phone if provided
+        result = await process_chat(
+            entity=request.entity,
+            query=request.query,
+            model_name=request.model,
+            phone_number=request.fromNumber
+        )
 
         # Convert retrieved_docs to RetrievedDocument models
         formatted_docs = [
@@ -235,6 +253,30 @@ async def chat(request: ChatRequest):
             )
             for doc in result["retrieved_docs"]
         ]
+
+        # If webhook request, send WhatsApp message via mtalkzService
+        if is_webhook:
+            try:
+                from services.mtalkzService import send_interactive_button_message
+
+                answer = result["answer"]
+                body_text = answer[:1000] if len(answer) > 1000 else answer
+
+                buttons = [{"id": "main_menu", "title": "Main Menu"}]
+
+                await send_interactive_button_message(
+                    to_phone=request.toNumber,
+                    from_phone=request.fromNumber,
+                    header_text=" ",
+                    body_text=body_text,
+                    footer_text="Powered by AI",
+                    buttons=buttons,
+                    conversation_id=None,
+                    access_token=request.accessToken
+                )
+            except Exception as wa_error:
+                print(f"Warning: Failed to send WhatsApp message: {str(wa_error)}")
+                # Don't fail the request if WhatsApp sending fails
 
         return ChatResponse(
             success=True,
