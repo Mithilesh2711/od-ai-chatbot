@@ -108,8 +108,8 @@ async def _process_chat_core(entity: str, query: str, model_name: str = None, ph
     print(f"Entity name: {entity_name}")
 
     # Initialize state with model_name and llm_instance
+    # IMPORTANT: Don't set "messages" key to allow checkpointer to restore from memory
     initial_state: LeadsState = {
-        "messages": [],
         "entity": entity,
         "entity_name": entity_name,
         "query": query,

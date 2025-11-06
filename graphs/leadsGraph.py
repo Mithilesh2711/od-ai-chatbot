@@ -42,7 +42,7 @@ def classify_query_node(state: LeadsState) -> LeadsState:
     node_start = time.time()
 
     query = state["query"]
-    messages = state["messages"]
+    messages = state.get("messages", [])  # Default to empty if not in state
     llm = state.get("llm_instance")
 
     if not llm:
@@ -499,7 +499,7 @@ def generate_node(state: LeadsState) -> LeadsState:
         llm = get_llm_instance()
 
     # Trim messages using sliding window before adding new ones
-    current_messages = state["messages"]
+    current_messages = state.get("messages", [])  # Default to empty if not in state
     if settings.ENABLE_CHAT_MEMORY and len(current_messages) > 0:
         current_messages = trim_messages_sliding_window(current_messages)
 
