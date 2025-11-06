@@ -39,14 +39,16 @@ class WebScraper:
         return url.startswith(base_domain)
 
     def _is_valid_url(self, url: str) -> bool:
-        """Check if URL is valid for scraping (exclude media, documents, etc.)"""
+        """Check if URL is valid for scraping (exclude media, documents, etc.)
+        Note: PDFs are now handled separately and extracted during scraping
+        """
         excluded_extensions = [
-            '.pdf', '.jpg', '.jpeg', '.png', '.gif', '.svg', '.ico',
+            '.jpg', '.jpeg', '.png', '.gif', '.svg', '.ico',
             '.css', '.js', '.xml', '.json', '.zip', '.exe', '.doc',
             '.docx', '.xls', '.xlsx', '.ppt', '.pptx'
         ]
 
-        # Check for excluded extensions
+        # Check for excluded extensions (PDF removed - handled separately)
         if any(url.lower().endswith(ext) for ext in excluded_extensions):
             return False
 
@@ -128,7 +130,7 @@ class WebScraper:
                 "success": False
             }
 
-    async def scrape_domain(self, start_url: str) -> List[Dict[str, Any]]:
+    async def scrape_domain(self, start_url: str) -> tuple[List[Dict[str, Any]], List[str]]:
         """
         Scrape entire domain starting from a URL
 
@@ -136,12 +138,15 @@ class WebScraper:
             start_url: Starting URL to scrape
 
         Returns:
-            List of scraped pages with text and metadata
+            Tuple of (scraped_pages, pdf_urls_found)
+            - scraped_pages: List of scraped pages with text and metadata
+            - pdf_urls_found: List of PDF URLs discovered during scraping
         """
         base_domain = self._get_domain(start_url)
         visited: Set[str] = set()
         to_visit: List[tuple[str, int]] = [(start_url, 0)]  # (url, depth)
         scraped_pages = []
+        pdf_urls_found = []
 
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=self.headless)
@@ -159,6 +164,14 @@ class WebScraper:
 
                 # Skip if max depth exceeded
                 if depth > self.max_depth:
+                    continue
+
+                # Check if URL is a PDF
+                if current_url.lower().endswith('.pdf'):
+                    if current_url not in pdf_urls_found:
+                        pdf_urls_found.append(current_url)
+                        print(f"[SCRAPER] Found PDF: {current_url}")
+                    visited.add(current_url)
                     continue
 
                 # Skip if not valid URL
@@ -182,17 +195,23 @@ class WebScraper:
                     for link in result.get("links", []):
                         if (
                             link not in visited and
-                            self._is_same_domain(link, base_domain) and
-                            self._is_valid_url(link)
+                            self._is_same_domain(link, base_domain)
                         ):
-                            to_visit.append((link, depth + 1))
+                            # Separate PDF links from regular pages
+                            if link.lower().endswith('.pdf'):
+                                if link not in pdf_urls_found:
+                                    pdf_urls_found.append(link)
+                                    print(f"[SCRAPER] Found PDF: {link}")
+                            elif self._is_valid_url(link):
+                                to_visit.append((link, depth + 1))
 
                 # Small delay to be respectful
                 await asyncio.sleep(0.5)
 
             await browser.close()
 
-        return scraped_pages
+        print(f"[SCRAPER] Completed: {len(scraped_pages)} pages scraped, {len(pdf_urls_found)} PDFs found")
+        return scraped_pages, pdf_urls_found
 
 # Global scraper instance
 web_scraper = WebScraper()

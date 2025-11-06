@@ -16,6 +16,7 @@ from services.vectorService import router as vector_router
 from services.scrapingService import router as scraping_router
 from services.leadsService import router as leads_router
 from services.mtalkzService import router as mtalkz_router
+from services.requestLogRoutes import router as logs_router
 
 # FastAPI app initialization
 app = FastAPI(title=API_TITLE, version=API_VERSION)
@@ -35,6 +36,7 @@ app.include_router(vector_router)
 app.include_router(scraping_router)
 app.include_router(leads_router)
 app.include_router(mtalkz_router)
+app.include_router(logs_router)
 
 # Root endpoint
 @app.get("/")

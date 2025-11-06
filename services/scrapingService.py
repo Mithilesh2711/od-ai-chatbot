@@ -2,11 +2,14 @@ from fastapi import APIRouter, HTTPException, status, BackgroundTasks, Depends
 from pydantic import BaseModel, Field, HttpUrl
 from typing import List, Dict, Any, Optional
 from knowledge.scraper import web_scraper
+from knowledge.pdfProcessor import process_pdf_from_url
 from rag.chunking import chunking_service
 from vectorStore.embeddings import embedding_service
 from vectorStore.qdrantClient import qdrant_service
 from datetime import datetime
 from middleware.auth import jwt_auth
+from services.requestLogService import request_log_service
+import uuid
 
 router = APIRouter(prefix="/api/scraping", tags=["Scraping"])
 
@@ -19,6 +22,7 @@ class EntityUrlScrapingRequest(BaseModel):
 
 class ScrapingMetadata(BaseModel):
     pages_scraped: int
+    pdfs_processed: int = 0
     chunks_created: int
     vectors_stored: int
     entity: str
@@ -41,16 +45,25 @@ async def scrape_and_store_task(
     url: str,
     entity: str,
     max_pages: int,
-    max_depth: int
+    max_depth: int,
+    session_id: str = None,
+    user_id: str = None,
+    user_name: str = None,
+    user_mobile: str = None
 ) -> Dict[str, Any]:
     """
     Background task to scrape website and store in vector DB
+    Also detects and processes PDF URLs during scraping
 
     Args:
         url: URL to scrape
         entity: Entity identifier
         max_pages: Maximum pages to scrape
         max_depth: Maximum depth to follow links
+        session_id: Session identifier for logging
+        user_id: User ID for logging
+        user_name: User name for logging
+        user_mobile: User mobile for logging
 
     Returns:
         Metadata about the scraping operation
@@ -62,81 +75,135 @@ async def scrape_and_store_task(
         web_scraper.max_pages = max_pages
         web_scraper.max_depth = max_depth
 
-        # Scrape domain
+        # Scrape domain (returns both pages and PDF URLs)
         print(f"[BACKGROUND] Starting scrape for {url}")
-        scraped_pages = await web_scraper.scrape_domain(url)
-        print(f"[BACKGROUND] Scraped {len(scraped_pages)} pages")
+        scraped_pages, pdf_urls_found = await web_scraper.scrape_domain(url)
+        print(f"[BACKGROUND] Scraped {len(scraped_pages)} pages, found {len(pdf_urls_found)} PDFs")
 
-        if not scraped_pages:
-            print(f"[BACKGROUND] ERROR: No pages were successfully scraped for {url}")
+        # Track PDF processing
+        pdfs_processed = 0
+        total_vectors_from_pdfs = 0
+
+        if not scraped_pages and not pdf_urls_found:
+            print(f"[BACKGROUND] ERROR: No pages or PDFs were found for {url}")
             return {
                 "success": False,
-                "error": "No pages were successfully scraped",
+                "error": "No pages or PDFs were found",
                 "entity": entity
             }
 
-        # Prepare documents for chunking
-        documents = []
-        for page in scraped_pages:
-            if page.get("text") and page["text"].strip():
-                documents.append({
-                    "text": page["text"],
-                    "metadata": {
-                        "source_type": "web_scrape",
-                        "entity": entity,
-                        "url": page["url"],
-                        "title": page.get("title", ""),
-                        "depth": page.get("depth", 0)
-                    }
-                })
+        # Process PDFs first if found
+        if pdf_urls_found:
+            print(f"[BACKGROUND] Processing {len(pdf_urls_found)} PDF files...")
+            for pdf_url in pdf_urls_found:
+                try:
+                    pdf_result = await process_pdf_from_url(pdf_url, entity)
+                    if pdf_result.get("success"):
+                        pdfs_processed += 1
+                        total_vectors_from_pdfs += pdf_result.get("vectors_stored", 0)
+                        print(f"[BACKGROUND] ✓ PDF processed: {pdf_url} ({pdf_result.get('vectors_stored', 0)} vectors)")
+                    else:
+                        print(f"[BACKGROUND] ✗ Failed to process PDF: {pdf_url} - {pdf_result.get('error', 'Unknown error')}")
+                except Exception as e:
+                    print(f"[BACKGROUND] ✗ Error processing PDF {pdf_url}: {str(e)}")
 
-        print(f"[BACKGROUND] Prepared {len(documents)} documents for chunking")
+        # Prepare documents for chunking (regular web pages)
+        documents = []
+        if scraped_pages:
+            for page in scraped_pages:
+                if page.get("text") and page["text"].strip():
+                    documents.append({
+                        "text": page["text"],
+                        "metadata": {
+                            "source_type": "web_scrape",
+                            "entity": entity,
+                            "url": page["url"],
+                            "title": page.get("title", ""),
+                            "depth": page.get("depth", 0)
+                        }
+                    })
+
+            print(f"[BACKGROUND] Prepared {len(documents)} web pages for chunking")
 
         # Chunk documents
-        all_chunks = chunking_service.chunk_documents(documents)
-        print(f"[BACKGROUND] Created {len(all_chunks)} chunks")
+        all_chunks = []
+        if documents:
+            all_chunks = chunking_service.chunk_documents(documents)
+            print(f"[BACKGROUND] Created {len(all_chunks)} chunks from web pages")
 
-        if not all_chunks:
-            print(f"[BACKGROUND] ERROR: No chunks were created from scraped content")
-            return {
-                "success": False,
-                "error": "No chunks were created from scraped content",
-                "entity": entity
-            }
+        # Prepare for vector storage (web pages)
+        total_vectors_from_pages = 0
+        if all_chunks:
+            texts = []
+            metadata_list = []
 
-        # Prepare for vector storage
-        texts = []
-        metadata_list = []
+            for chunk in all_chunks:
+                texts.append(chunk["text"])
 
-        for chunk in all_chunks:
-            texts.append(chunk["text"])
+                # Combine chunk metadata with document metadata
+                chunk_metadata = chunk["metadata"].copy()
+                chunk_metadata["chunk_index"] = chunk["chunk_index"]
+                chunk_metadata["total_chunks"] = chunk["total_chunks"]
 
-            # Combine chunk metadata with document metadata
-            chunk_metadata = chunk["metadata"].copy()
-            chunk_metadata["chunk_index"] = chunk["chunk_index"]
-            chunk_metadata["total_chunks"] = chunk["total_chunks"]
+                metadata_list.append(chunk_metadata)
 
-            metadata_list.append(chunk_metadata)
+            # Generate embeddings
+            print(f"[BACKGROUND] Generating embeddings for {len(texts)} chunks")
+            embeddings = embedding_service.generate_embeddings(texts)
+            print(f"[BACKGROUND] Generated {len(embeddings)} embeddings")
 
-        # Generate embeddings
-        print(f"[BACKGROUND] Generating embeddings for {len(texts)} chunks")
-        embeddings = embedding_service.generate_embeddings(texts)
-        print(f"[BACKGROUND] Generated {len(embeddings)} embeddings")
+            # Store in vector database (all go to same collection)
+            print(f"[BACKGROUND] Storing vectors in collection for entity={entity}")
+            point_ids = qdrant_service.store_vectors(
+                texts=texts,
+                embeddings=embeddings,
+                metadata_list=metadata_list
+            )
+            total_vectors_from_pages = len(point_ids)
+            print(f"[BACKGROUND] ✓ Stored {len(point_ids)} vectors from web pages")
 
-        # Store in vector database (all go to same collection)
-        print(f"[BACKGROUND] Storing vectors in collection for entity={entity}")
-        point_ids = qdrant_service.store_vectors(
-            texts=texts,
-            embeddings=embeddings,
-            metadata_list=metadata_list
-        )
-        print(f"[BACKGROUND] ✓ Scraping completed: Stored {len(point_ids)} vectors for entity={entity}")
+        # Calculate totals
+        total_vectors = total_vectors_from_pages + total_vectors_from_pdfs
+        total_chunks = len(all_chunks) + total_vectors_from_pdfs  # Approximate
+
+        print(f"[BACKGROUND] ✓ Scraping completed:")
+        print(f"  - Pages: {len(scraped_pages)}")
+        print(f"  - PDFs: {pdfs_processed}/{len(pdf_urls_found)}")
+        print(f"  - Total vectors: {total_vectors}")
+
+        # Log the scraping operation to Qdrant
+        if session_id:
+            try:
+                request_log_service.log_request(
+                    entity=entity,
+                    session=session_id,
+                    operation_type="web_scraping",
+                    user_id=user_id,
+                    user_name=user_name,
+                    user_mobile=user_mobile,
+                    pdf_url=None,
+                    website_url=url,
+                    metadata={
+                        "pages_scraped": len(scraped_pages),
+                        "pdfs_processed": pdfs_processed,
+                        "total_pdfs_found": len(pdf_urls_found),
+                        "chunks_created": total_chunks,
+                        "vectors_stored": total_vectors,
+                        "max_pages": max_pages,
+                        "max_depth": max_depth,
+                        "status": "success"
+                    }
+                )
+                print(f"[BACKGROUND] ✓ Request logged successfully")
+            except Exception as log_error:
+                print(f"[BACKGROUND] Warning: Failed to log request: {str(log_error)}")
 
         return {
             "success": True,
             "pages_scraped": len(scraped_pages),
-            "chunks_created": len(all_chunks),
-            "vectors_stored": len(point_ids),
+            "pdfs_processed": pdfs_processed,
+            "chunks_created": total_chunks,
+            "vectors_stored": total_vectors,
             "entity": entity
         }
 
@@ -191,13 +258,21 @@ async def entity_url_scraping(
         else:
             estimated_time = f"{estimated_minutes}-{estimated_minutes + 2} minutes"
 
+        # Generate session ID for logging
+        session_id = str(uuid.uuid4())
+        user_doc = auth_data.get("user", {})
+
         # Add scraping task to background
         background_tasks.add_task(
             scrape_and_store_task,
             url=str(request.url),
             entity=request.entity,
             max_pages=request.max_pages,
-            max_depth=request.max_depth
+            max_depth=request.max_depth,
+            session_id=session_id,
+            user_id=auth_data.get("user_id"),
+            user_name=user_doc.get("name", ""),
+            user_mobile=user_doc.get("mobile", "")
         )
 
         print(f"Background scraping task started for entity, url={request.url}")

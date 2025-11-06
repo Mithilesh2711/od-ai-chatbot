@@ -8,7 +8,7 @@
 # =============================================================================
 
 # OpenAI Configuration
-OPENAI_API_KEY = "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"
+OPENAI_API_KEY = "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"
 OPENAI_MODEL = "gpt-3.5-turbo"  # Default model for quick responses
 
 # Claude (Anthropic) Configuration
@@ -94,3 +94,16 @@ MTALKZ_ACCESS_TOKEN = ""  # Add your mTalkz access token
 # JWT Authentication Configuration
 JWT_SECRET_KEY = "thesecrettopayismoney"  # Change this to a secure secret key
 JWT_ALGORITHM = "HS256"
+
+# PostgreSQL Configuration for Chat Memory
+POSTGRES_URL = "postgresql://postgres:Sittu2711@db.sacbiiolerutbchkjxrz.supabase.co:5432/postgres"  # Update with your PostgreSQL connection
+
+# Chat Memory Configuration
+ENABLE_CHAT_MEMORY = True
+SLIDING_WINDOW_SIZE = 20  # Keep last 20 messages in memory (10 user + 10 AI)
+
+# =============================================================================
+# Multilingual Translation Configuration
+# =============================================================================
+ENABLE_MULTILINGUAL = True  # Enable Hindi, English, and Hinglish support
+# Translation uses the same LLM instance as the RAG pipeline (model_name from chatBotConfig)
