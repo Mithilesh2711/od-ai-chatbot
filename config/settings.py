@@ -96,7 +96,7 @@ JWT_SECRET_KEY = "thesecrettopayismoney"  # Change this to a secure secret key
 JWT_ALGORITHM = "HS256"
 
 # PostgreSQL Configuration for Chat Memory
-POSTGRES_URL = "postgresql://postgres:Sittu2711@db.sacbiiolerutbchkjxrz.supabase.co:5432/postgres"  # Update with your PostgreSQL connection
+POSTGRES_URL = "postgresql://postgres.sacbiiolerutbchkjxrz:Sittu2711@aws-1-ap-south-1.pooler.supabase.com:5432/postgres"  # Update with your PostgreSQL connection
 
 # Chat Memory Configuration
 ENABLE_CHAT_MEMORY = True
