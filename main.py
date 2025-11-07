@@ -21,13 +21,14 @@ from services.requestLogRoutes import router as logs_router
 # FastAPI app initialization
 app = FastAPI(title=API_TITLE, version=API_VERSION)
 
-# CORS middleware
+# CORS middleware - Allow all origins with no restrictions
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["*"],  # Allow all origins
+    allow_credentials=False,  # Must be False when using wildcard origins
+    allow_methods=["*"],  # Allow all HTTP methods
+    allow_headers=["*"],  # Allow all headers
+    expose_headers=["*"],  # Expose all headers to the client
 )
 
 # Register service routers
