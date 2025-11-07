@@ -68,8 +68,31 @@ async def scrape_and_store_task(
     Returns:
         Metadata about the scraping operation
     """
+    log_id = None
     try:
         print(f"[BACKGROUND] Starting scrape task for entity={entity}, url={url}")
+
+        # Log initial "processing" status
+        if session_id:
+            try:
+                log_id = request_log_service.log_request(
+                    entity=entity,
+                    session=session_id,
+                    operation_type="web_scraping",
+                    user_id=user_id,
+                    user_name=user_name,
+                    user_mobile=user_mobile,
+                    pdf_url=None,
+                    website_url=url,
+                    metadata={
+                        "max_pages": max_pages,
+                        "max_depth": max_depth,
+                        "status": "processing"
+                    }
+                )
+                print(f"[BACKGROUND] ✓ Request logged with status 'processing', log_id={log_id}")
+            except Exception as log_error:
+                print(f"[BACKGROUND] Warning: Failed to log initial request: {str(log_error)}")
 
         # Configure scraper
         web_scraper.max_pages = max_pages
@@ -86,6 +109,22 @@ async def scrape_and_store_task(
 
         if not scraped_pages and not pdf_urls_found:
             print(f"[BACKGROUND] ERROR: No pages or PDFs were found for {url}")
+
+            # Update log with "failed" status
+            if session_id and log_id:
+                try:
+                    request_log_service.update_log(
+                        log_id=log_id,
+                        metadata={
+                            "error": "No pages or PDFs were found",
+                            "status": "failed"
+                        },
+                        status="failed"
+                    )
+                    print(f"[BACKGROUND] ✓ Request log updated with status 'failed'")
+                except Exception as log_error:
+                    print(f"[BACKGROUND] Warning: Failed to update request log: {str(log_error)}")
+
             return {
                 "success": False,
                 "error": "No pages or PDFs were found",
@@ -171,18 +210,11 @@ async def scrape_and_store_task(
         print(f"  - PDFs: {pdfs_processed}/{len(pdf_urls_found)}")
         print(f"  - Total vectors: {total_vectors}")
 
-        # Log the scraping operation to Qdrant
-        if session_id:
+        # Update log with "completed" status
+        if session_id and log_id:
             try:
-                request_log_service.log_request(
-                    entity=entity,
-                    session=session_id,
-                    operation_type="web_scraping",
-                    user_id=user_id,
-                    user_name=user_name,
-                    user_mobile=user_mobile,
-                    pdf_url=None,
-                    website_url=url,
+                request_log_service.update_log(
+                    log_id=log_id,
                     metadata={
                         "pages_scraped": len(scraped_pages),
                         "pdfs_processed": pdfs_processed,
@@ -191,12 +223,13 @@ async def scrape_and_store_task(
                         "vectors_stored": total_vectors,
                         "max_pages": max_pages,
                         "max_depth": max_depth,
-                        "status": "success"
-                    }
+                        "status": "completed"
+                    },
+                    status="completed"
                 )
-                print(f"[BACKGROUND] ✓ Request logged successfully")
+                print(f"[BACKGROUND] ✓ Request log updated with status 'completed'")
             except Exception as log_error:
-                print(f"[BACKGROUND] Warning: Failed to log request: {str(log_error)}")
+                print(f"[BACKGROUND] Warning: Failed to update request log: {str(log_error)}")
 
         return {
             "success": True,
@@ -211,6 +244,22 @@ async def scrape_and_store_task(
         print(f"[BACKGROUND] ERROR in scraping task for entity={entity}: {str(e)}")
         import traceback
         print(f"[BACKGROUND] Traceback: {traceback.format_exc()}")
+
+        # Update log with "failed" status
+        if session_id and log_id:
+            try:
+                request_log_service.update_log(
+                    log_id=log_id,
+                    metadata={
+                        "error": str(e),
+                        "status": "failed"
+                    },
+                    status="failed"
+                )
+                print(f"[BACKGROUND] ✓ Request log updated with status 'failed'")
+            except Exception as log_error:
+                print(f"[BACKGROUND] Warning: Failed to update request log: {str(log_error)}")
+
         return {
             "success": False,
             "error": str(e),

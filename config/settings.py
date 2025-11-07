@@ -8,7 +8,7 @@
 # =============================================================================
 
 # OpenAI Configuration
-OPENAI_API_KEY = "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"
+OPENAI_API_KEY = "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"
 OPENAI_MODEL = "gpt-3.5-turbo"  # Default model for quick responses
 
 # Claude (Anthropic) Configuration

@@ -1,4 +1,5 @@
 .env
+nul
 
 # Virtual Environments
 .venv/

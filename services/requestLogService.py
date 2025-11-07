@@ -168,6 +168,75 @@ class RequestLogService:
             print(f"❌ Error logging request: {str(e)}")
             raise
 
+    def update_log(
+        self,
+        log_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+        status: Optional[str] = None
+    ) -> bool:
+        """
+        Update an existing log entry with new metadata and/or status
+
+        Args:
+            log_id: The UUID of the log to update
+            metadata: Updated metadata (will merge with existing)
+            status: Updated status to set in metadata
+
+        Returns:
+            bool: True if successful
+        """
+        try:
+            # Get existing point
+            existing_points = self.client.retrieve(
+                collection_name=self.collection_name,
+                ids=[log_id],
+                with_payload=True,
+                with_vectors=False
+            )
+
+            if not existing_points:
+                print(f"⚠️ Log {log_id} not found for update")
+                return False
+
+            # Get existing payload
+            existing_payload = existing_points[0].payload
+
+            # Merge metadata if provided
+            if metadata:
+                existing_metadata = existing_payload.get("metadata", {})
+                existing_metadata.update(metadata)
+                if status:
+                    existing_metadata["status"] = status
+                existing_payload["metadata"] = existing_metadata
+            elif status:
+                # Update just the status in metadata
+                existing_metadata = existing_payload.get("metadata", {})
+                existing_metadata["status"] = status
+                existing_payload["metadata"] = existing_metadata
+
+            # Update timestamp
+            existing_payload["lastUpdated"] = datetime.utcnow().isoformat()
+
+            # Create updated point
+            point = PointStruct(
+                id=log_id,
+                vector=[0.0],  # Dummy vector
+                payload=existing_payload
+            )
+
+            # Upsert (update) in Qdrant
+            self.client.upsert(
+                collection_name=self.collection_name,
+                points=[point]
+            )
+
+            print(f"✓ Updated log {log_id} with status: {status}")
+            return True
+
+        except Exception as e:
+            print(f"❌ Error updating log: {str(e)}")
+            raise
+
     def get_logs(
         self,
         entity: Optional[str] = None,
