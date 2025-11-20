@@ -36,6 +36,7 @@ class ChatResponse(BaseModel):
     query: str
     retrieved_docs_count: int
     retrieved_docs: List[RetrievedDocument]
+    source_urls: List[str]  # URLs of picked vectors for reference
     timestamp: str
 
 class PDFUrlRequest(BaseModel):
@@ -254,6 +255,12 @@ async def chat(request: ChatRequest):
             for doc in result["retrieved_docs"]
         ]
 
+        # Extract unique URLs from retrieved documents for quick reference
+        source_urls = list(set([
+            doc.get("url") for doc in result["retrieved_docs"]
+            if doc.get("url") is not None
+        ]))
+
         # If webhook request, send WhatsApp message via mtalkzService
         if is_webhook:
             try:
@@ -285,6 +292,7 @@ async def chat(request: ChatRequest):
             query=result["query"],
             retrieved_docs_count=result["retrieved_docs_count"],
             retrieved_docs=formatted_docs,
+            source_urls=source_urls,
             timestamp=datetime.utcnow().isoformat()
         )
 

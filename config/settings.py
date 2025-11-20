@@ -96,11 +96,19 @@ JWT_SECRET_KEY = "thesecrettopayismoney"  # Change this to a secure secret key
 JWT_ALGORITHM = "HS256"
 
 # PostgreSQL Configuration for Chat Memory
-POSTGRES_URL = "postgresql://postgres.sacbiiolerutbchkjxrz:Sittu2711@aws-1-ap-south-1.pooler.supabase.com:5432/postgres"  # Update with your PostgreSQL connection
+# Using Supabase pooler with connection recycling
+POSTGRES_URL = "postgresql://postgres.sacbiiolerutbchkjxrz:Sittu2711@aws-1-ap-south-1.pooler.supabase.com:5432/postgres?application_name=od-chatbot"
 
 # Chat Memory Configuration
 ENABLE_CHAT_MEMORY = True
 SLIDING_WINDOW_SIZE = 20  # Keep last 20 messages in memory (10 user + 10 AI)
+
+# PostgreSQL Connection Pool Configuration
+POSTGRES_POOL_MIN_SIZE = 1  # Minimum connections in pool
+POSTGRES_POOL_MAX_SIZE = 5  # Maximum connections in pool (reduced for Supabase pooler)
+POSTGRES_MAX_IDLE = 60.0  # Recycle idle connections after 1 minute (in seconds)
+POSTGRES_MAX_LIFETIME = 300.0  # Recycle all connections after 5 minutes (in seconds)
+POSTGRES_CONNECT_TIMEOUT = 10  # Connection timeout in seconds
 
 # =============================================================================
 # Multilingual Translation Configuration

@@ -208,29 +208,54 @@ def query_transform_node(state: LeadsState) -> LeadsState:
         transformer = get_query_transformer(llm_model=model_name)
 
         # Transform query using async version for parallel execution
-        # Run the async function in the event loop
+        # Handle async/sync context properly
         try:
-            loop = asyncio.get_event_loop()
+            # Check if event loop is already running (FastAPI context)
+            loop = asyncio.get_running_loop()
+            # If we're in an async context, run in thread pool to avoid "loop already running" error
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future = executor.submit(
+                    asyncio.run,
+                    transformer.transform_query_async(
+                        query=query,
+                        use_multi_query=True,
+                        use_hyde=True,
+                        num_variations=3
+                    )
+                )
+                transformed = future.result()
         except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-
-        transformed = loop.run_until_complete(
-            transformer.transform_query_async(
-                query=query,
-                use_multi_query=True,
-                use_hyde=True,
-                num_variations=3
+            # No running loop, safe to use asyncio.run()
+            transformed = asyncio.run(
+                transformer.transform_query_async(
+                    query=query,
+                    use_multi_query=True,
+                    use_hyde=True,
+                    num_variations=3
+                )
             )
-        )
 
         node_end = time.time()
         print(f"  ⏱️  [QUERY_TRANSFORM] Total node time: {node_end - node_start:.3f}s")
 
+        # Log transformed queries
+        query_variations = transformed.get("query_variations")
+        hypothetical_doc = transformed.get("hypothetical_doc")
+
+        if query_variations:
+            print(f"  🔄 [QUERY_TRANSFORM] Generated {len(query_variations)} query variations:")
+            for idx, variation in enumerate(query_variations, 1):
+                print(f"      {idx}. {variation}")
+
+        if hypothetical_doc:
+            print(f"  📝 [QUERY_TRANSFORM] HyDE document (first 150 chars):")
+            print(f"      {hypothetical_doc[:150]}...")
+
         return {
             **state,
-            "query_variations": transformed.get("query_variations"),
-            "hypothetical_doc": transformed.get("hypothetical_doc")
+            "query_variations": query_variations,
+            "hypothetical_doc": hypothetical_doc
         }
 
     except Exception as e:
@@ -346,6 +371,16 @@ def retrieve_node(state: LeadsState) -> LeadsState:
     node_end = time.time()
     print(f"  ⏱️  [RETRIEVE] Total node time: {node_end - node_start:.3f}s")
     print(f"Retrieved {len(all_results)} unique documents")
+
+    # Log source URLs from retrieved documents
+    source_urls = [doc.get('metadata', {}).get('url') for doc in all_results if doc.get('metadata', {}).get('url')]
+    if source_urls:
+        print(f"  📎 [RETRIEVE] Source URLs retrieved from RAG:")
+        for idx, url in enumerate(source_urls, 1):
+            print(f"      {idx}. {url}")
+    else:
+        print(f"  ℹ️  [RETRIEVE] No source URLs found in retrieved documents")
+
     return {
         **state,
         "retrieved_docs": all_results
@@ -384,6 +419,13 @@ def rerank_node(state: LeadsState) -> LeadsState:
         node_end = time.time()
         print(f"  ⏱️  [RERANK] Total node time: {node_end - node_start:.3f}s")
         print(f"  ✓ Reranked to top {len(reranked_docs)} documents")
+
+        # Log source URLs after reranking
+        reranked_urls = [doc.get('metadata', {}).get('url') for doc in reranked_docs if doc.get('metadata', {}).get('url')]
+        if reranked_urls:
+            print(f"  📎 [RERANK] Source URLs after reranking:")
+            for idx, url in enumerate(reranked_urls, 1):
+                print(f"      {idx}. {url}")
 
         return {
             **state,
@@ -615,6 +657,8 @@ def get_postgres_checkpointer():
 
         print(f"[+] Initializing PostgreSQL checkpointer")
         print(f"    Connection: {connection_string.split('@')[-1] if '@' in connection_string else 'local'}")
+        print(f"    Pool config: min={settings.POSTGRES_POOL_MIN_SIZE}, max={settings.POSTGRES_POOL_MAX_SIZE}")
+        print(f"    Connection lifecycle: max_idle={settings.POSTGRES_MAX_IDLE}s, max_lifetime={settings.POSTGRES_MAX_LIFETIME}s")
 
         # Test DNS resolution first
         # try:
@@ -628,31 +672,52 @@ def get_postgres_checkpointer():
         #     print(f"[!] Continuing without chat memory (stateless mode)")
         #     return None
 
-        # Create connection pool with timeout and lazy opening
+        # Create connection pool with timeout and connection recycling
         pool = ConnectionPool(
             conninfo=connection_string,
-            min_size=1,  # Minimum connections
-            max_size=20,  # Maximum connections
+            min_size=settings.POSTGRES_POOL_MIN_SIZE,
+            max_size=settings.POSTGRES_POOL_MAX_SIZE,
+            max_idle=settings.POSTGRES_MAX_IDLE,  # Recycle idle connections
+            max_lifetime=settings.POSTGRES_MAX_LIFETIME,  # Recycle all connections
             open=False,  # Don't open connections immediately
             timeout=10.0,  # Connection timeout
             kwargs={
                 "autocommit": True,
                 "prepare_threshold": 0,
-                "connect_timeout": 10,
-            }
+                "connect_timeout": settings.POSTGRES_CONNECT_TIMEOUT,
+            },
+            check=ConnectionPool.check_connection  # Validate connections before use
         )
 
         # Open the pool (creates initial connections)
         print(f"[+] Opening connection pool...")
-        pool.open()
+        max_retries = 3
+        retry_delay = 2  # seconds
+
+        for attempt in range(max_retries):
+            try:
+                pool.open()
+                break
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    print(f"[!] Pool open failed (attempt {attempt + 1}/{max_retries}): {e}")
+                    print(f"[+] Retrying in {retry_delay}s...")
+                    import time
+                    time.sleep(retry_delay)
+                else:
+                    raise
 
         # Create checkpointer with pool
         checkpointer = PostgresSaver(pool)
 
         # Setup tables (creates if not exists)
         print(f"[+] Setting up checkpoint tables...")
-        with pool.connection() as conn:
-            checkpointer.setup()
+        try:
+            with pool.connection() as conn:
+                checkpointer.setup()
+        except Exception as e:
+            print(f"[!] Warning: Checkpoint table setup error: {e}")
+            print(f"[!] Tables may already exist or will be created on first use")
 
         print(f"[✓] PostgreSQL checkpointer initialized successfully")
         print(f"[+] Chat Memory: Sliding window enabled (last {settings.SLIDING_WINDOW_SIZE} messages)")
